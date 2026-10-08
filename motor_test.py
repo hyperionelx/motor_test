@@ -995,7 +995,7 @@ def gui(args):
         steps_var = tk.StringVar(value=str(args.steps))
         file_var = tk.StringVar(value="尚未导入 mapping")
         test_status = tk.StringVar(value="请先导入 mapping 曲线")
-        z_position = tk.StringVar(value="当前 Z 坐标：未连接")
+        z_position = tk.StringVar(value="Z: 未连接")
         z_limit = tk.StringVar(value="Z 固件最大速度：未连接")
         ttk.Label(controls, text="每一步时间 ms").pack(side="left")
         ttk.Entry(controls, textvariable=step_ms_var, width=10).pack(side="left", padx=5)
@@ -1120,7 +1120,10 @@ def gui(args):
 
         ttk.Button(controls, text="Z 马达回到 0", command=move_z_zero).pack(side="left", padx=5)
         ideal_page_state["start"] = start_button
-        ttk.Label(top, textvariable=z_position, font=("TkDefaultFont", 11)).pack(anchor="w", padx=10)
+        z_info = ttk.Frame(top, padding=(8, 0, 8, 2))
+        z_info.pack(fill="x", before=xy_controls)
+        ttk.Label(z_info, textvariable=z_position, font=("TkDefaultFont", 9),
+                  anchor="e").pack(side="right")
         ttk.Label(top, textvariable=z_limit, foreground="gray").pack(anchor="w", padx=10)
         ttk.Label(top, textvariable=test_status, foreground="gray").pack(anchor="w", padx=10)
         ttk.Label(top, text="总时间 = 每一步时间 × 步数；曲线高度按相对位移处理，当前 Z 位置作为起点；"
@@ -1523,7 +1526,7 @@ def gui(args):
                     ideal_page_state["status"].set(value)
             elif kind == "curve_z_position":
                 if ideal_page_state["z_position"] is not None:
-                    ideal_page_state["z_position"].set(f"当前 Z 坐标：{value:.3f} μm")
+                    ideal_page_state["z_position"].set(f"Z: {value:.3f} μm")
             elif kind == "curve_z_limit":
                 if ideal_page_state["z_limit"] is not None:
                     ideal_page_state["z_limit"].set(f"Z 固件最大速度：{value:g} μm/s（只读）")
