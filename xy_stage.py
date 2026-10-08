@@ -12,7 +12,8 @@ REFERENCE_ROOT = Path("C:/Users/muyas/Desktop/i-ATF PC_0925_backup/新建文件�
 
 
 def default_dll_path():
-    candidates = [Path(__file__).resolve().parent / "dll/zauxdll64.dll",
+    candidates = [Path(__file__).resolve().parent / "zmotion/zauxdll64.dll",
+                  Path(__file__).resolve().parent / "dll/zauxdll64.dll",
                   REFERENCE_ROOT / "pc_app/translation stage/zauxdll64.dll"]
     return str(next((p for p in candidates if p.is_file()), candidates[0]))
 
@@ -24,6 +25,7 @@ class XYStage:
         self.source = source
         self.handle = ctypes.c_void_p()
         self.lock = threading.RLock()
+        self.mpos_offset = (0.0, 0.0)
         self.dll_path = str(Path(dll_path).resolve())
         self.dll_dirs = []
         if dll is None:
@@ -73,17 +75,53 @@ class XYStage:
                     self.call("ZAux_Direct_GetUnits", axis, ctypes.byref(units))
                     if atype.value != 65 or not math.isclose(units.value, 10000., abs_tol=1.):
                         raise RuntimeError(f"axis {axis} 类型/单位与参考设备不符：ATYPE={atype.value}, UNITS={units.value}")
+                # MPOS 是编码器坐标，DPOS 是控制器指令坐标。记录连接时的固定零点偏置，
+                # 只在软件反馈层补偿，不改写控制器坐标。
+                mpos = self._get_positions("Mpos")
+                dpos = self._get_positions("Dpos")
+                self.mpos_offset = tuple(mpos[i] - dpos[i] for i in range(2))
                 self.get_positions()
             except BaseException:
                 self.disconnect()
                 raise
 
     def get_positions(self):
+        if self.source == "DPOS":
+            return self._get_positions("Dpos")
+        raw = self._get_positions("Mpos")
+        return tuple(raw[i] - self.mpos_offset[i] for i in range(2))
+
+    def get_raw_mpositions(self):
+        return self._get_positions("Mpos")
+
+    def get_dpositions(self):
+        return self._get_positions("Dpos")
+
+    def sync_mpos_to_dpos(self):
+        """在轴空闲时把编码器反馈坐标 MPOS 对齐到当前指令坐标 DPOS。"""
+        with self.lock:
+            if not self.is_idle():
+                raise RuntimeError("只能在 XY 位移台空闲时校准 MPOS")
+            dpos = self._get_positions("Dpos")
+            fn = getattr(self.dll, "ZAux_Direct_SetMpos", None)
+            if fn is None:
+                raise RuntimeError("DLL 缺少 ZAux_Direct_SetMpos")
+            if not getattr(fn, "argtypes", None):
+                fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_float]
+                fn.restype = ctypes.c_int32
+            for axis, value in enumerate(dpos):
+                ret = fn(self.handle, axis, ctypes.c_float(value))
+                if ret != 0:
+                    raise RuntimeError(f"ZAux_Direct_SetMpos 返回错误码 {ret}")
+            self.mpos_offset = (0.0, 0.0)
+            return dpos
+
+    def _get_positions(self, name):
         with self.lock:
             values = []
             for axis in (0, 1):
                 value = ctypes.c_float()
-                self.call("ZAux_Direct_Get" + self.source.title(), axis, ctypes.byref(value))
+                self.call("ZAux_Direct_Get" + name, axis, ctypes.byref(value))
                 if not math.isfinite(value.value):
                     raise RuntimeError("XY 位置非有限数")
                 values.append(value.value)

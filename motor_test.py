@@ -122,69 +122,56 @@ class MotorLink:
         try:
             time.sleep(0.4)  # 与 pc_app 相同，等待可能发生的上电复位。
             self.ser.reset_input_buffer()
-            self.info = self.request(HELLO, struct.pack("<HI", 3, 7))
-            parameter = self.request(PARAM_READ, b"\x04")
-            if len(parameter) != 7 or parameter[2] != 4:
-                raise RuntimeError("最大速度参数响应无效")
-            self.max_velocity = struct.unpack_from("<f", parameter, 3)[0]
-            if not math.isfinite(self.max_velocity) or self.max_velocity <= 0:
-                raise RuntimeError("固件返回的最大速度无效")
-            hz = round(1000 / sample_ms)
-            if not 1 <= hz <= min(200, self.info["max_stream_hz"]):
-                raise ValueError("遥测周期超出当前固件支持范围")
-            self.request(STREAM_START, struct.pack("<HB", hz, 1))
-            self.until(lambda: self.latest is not None, 1.0)
+            self._start_session()
         except BaseException:
             self.close()
             raise
 
-    def send(self, cmd, body=b"", record=None, expect_ack=True):
-        if not hasattr(self, "unconfirmed"):
-            self.unconfirmed = {}
-        self.token = self.token % 255 + 1
-        key = (cmd, self.token)
-        if key in self.pending:
-            raise RuntimeError("待确认命令令牌冲突")
-        payload = bytes((self.session, self.token)) + body
-        frame = encode_frame(cmd, payload)
-        sent = time.perf_counter()
-        if record is not None:
-            record.update(token=self.token, sent_abs_s=sent, write_end_abs_s=sent,
-                          ack_abs_s=None, write_ok=False, ack_required=expect_ack)
-        try:
-            if self.ser.write(frame) != len(frame):
-                raise RuntimeError("串口写入不完整")
-        finally:
-            written = time.perf_counter()
-            if record is not None:
-                record["write_end_abs_s"] = written
-        if expect_ack:
-            self.pending[key] = (written, record)
-        else:
-            self.unconfirmed[key] = (written, record)
-        if record is not None:
-            record["write_ok"] = True
-        return key
+    def _start_session(self):
+        """建立一次完整的协议会话；可用于设备运行中复位后的恢复。"""
+        self.session = 0
+        self.token = 0
+        self.pending.clear()
+        self.unconfirmed.clear()
+        self.replies.clear()
+        self.latest = None
+        self.last_seq = self.last_ms = None
+        self.mcu_ms = 0
+        self.heartbeat_at = time.perf_counter()
+        self.info = self.request(HELLO, struct.pack("<HI", 3, 7))
+        parameter = self.request(PARAM_READ, b"\x04")
+        if len(parameter) != 7 or parameter[2] != 4:
+            raise RuntimeError("最大速度参数响应无效")
+        self.max_velocity = struct.unpack_from("<f", parameter, 3)[0]
+        if not math.isfinite(self.max_velocity) or self.max_velocity <= 0:
+            raise RuntimeError("固件返回的最大速度无效")
+        hz = round(1000 / self.sample_ms)
+        if not 1 <= hz <= min(200, self.info["max_stream_hz"]):
+            raise ValueError("遥测周期超出当前固件支持范围")
+        self.request(STREAM_START, struct.pack("<HB", hz, 1))
+        self.until(lambda: self.latest is not None, 1.0)
 
-    def until(self, predicate, timeout):
-        deadline = time.perf_counter() + timeout
-        while not predicate():
-            self.poll()
-            if time.perf_counter() >= deadline:
-                raise TimeoutError("握手、响应或遥测等待超时")
-            time.sleep(0.001)
+    def _recover_session(self):
+        """STM32 已复位时重新建立会话，不复用旧命令的 ACK/token。"""
+        self.events.append(dict(host_abs_s=time.perf_counter(), event="SESSION_RESET", detail=0))
+        self.decoder = Decoder()
+        self.ser.reset_input_buffer()
+        time.sleep(0.15)
+        self._start_session()
 
-    def request(self, cmd, body=b""):
-        key = self.send(cmd, body)
-        self.until(lambda: key in self.replies, 2.5)
-        return self.replies.pop(key)
+    def _handle_ready(self):
+        if self.session:
+            self._recover_session()
 
-    def poll(self):
+    def _poll_frames(self):
+        """读取并处理一批帧；返回是否发生会话复位。"""
+        reset = False
         for cmd, flags, payload in self.decoder.feed(self.ser.read(min(self.ser.in_waiting, 8192))):
             now = time.perf_counter()
             if cmd == READY:
                 if self.session:
-                    raise RuntimeError("STM32 运行中复位，会话失效")
+                    reset = True
+                    break
                 continue
             if cmd == HELLO and flags & RESPONSE:
                 key = (HELLO, payload[1]) if len(payload) >= 2 else None
@@ -252,6 +239,53 @@ class MotorLink:
                     pending[1]["ack_abs_s"] = now
                 if request_cmd in (PARAM_READ, STREAM_START, STREAM_STOP):
                     self.replies[key] = payload
+        return reset
+
+    def send(self, cmd, body=b"", record=None, expect_ack=True):
+        if not hasattr(self, "unconfirmed"):
+            self.unconfirmed = {}
+        self.token = self.token % 255 + 1
+        key = (cmd, self.token)
+        if key in self.pending:
+            raise RuntimeError("待确认命令令牌冲突")
+        payload = bytes((self.session, self.token)) + body
+        frame = encode_frame(cmd, payload)
+        sent = time.perf_counter()
+        if record is not None:
+            record.update(token=self.token, sent_abs_s=sent, write_end_abs_s=sent,
+                          ack_abs_s=None, write_ok=False, ack_required=expect_ack)
+        try:
+            if self.ser.write(frame) != len(frame):
+                raise RuntimeError("串口写入不完整")
+        finally:
+            written = time.perf_counter()
+            if record is not None:
+                record["write_end_abs_s"] = written
+        if expect_ack:
+            self.pending[key] = (written, record)
+        else:
+            self.unconfirmed[key] = (written, record)
+        if record is not None:
+            record["write_ok"] = True
+        return key
+
+    def until(self, predicate, timeout):
+        deadline = time.perf_counter() + timeout
+        while not predicate():
+            self.poll()
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("握手、响应或遥测等待超时")
+            time.sleep(0.001)
+
+    def request(self, cmd, body=b""):
+        key = self.send(cmd, body)
+        self.until(lambda: key in self.replies, 2.5)
+        return self.replies.pop(key)
+
+    def poll(self):
+        if self._poll_frames():
+            self._recover_session()
+            return
         now = time.perf_counter()
         if self.session and now - self.heartbeat_at >= 0.25:
             self.send(PING)
@@ -642,6 +676,9 @@ def gui(args):
     b = ttk.Button(controls, text="移动到位置", command=lambda: submit("move"))
     b.pack(side="left", padx=4)
     buttons.append(b)
+    xy_control_button = ttk.Button(controls, text="XY位移台控制", command=lambda: open_xy_control())
+    xy_control_button.pack(side="left", padx=4)
+    buttons.append(xy_control_button)
     presets = ttk.Frame(root, padding=5)
     presets.pack(fill="x")
     def preset(speed):
@@ -798,6 +835,79 @@ def gui(args):
             raise RuntimeError("XY位置来源/采样周期改变后请重新连接位移台")
         return stage, reader
 
+    def open_xy_control():
+        top = tk.Toplevel(root)
+        top.title("XY 位移台控制")
+        top.geometry("470x260")
+        top.transient(root)
+        current = tk.StringVar(value="当前坐标：未连接")
+        result = tk.StringVar(value="")
+        ttk.Label(top, textvariable=current, font=("TkDefaultFont", 11)).pack(pady=10)
+        form = ttk.Frame(top)
+        form.pack(fill="x", padx=18)
+        speed = tk.StringVar(value=str(args.xy_speed))
+        target_x = tk.StringVar(value=str(args.xy_start_x))
+        target_y = tk.StringVar(value=str(args.xy_start_y))
+        for row, (label, variable) in enumerate((("移动速度 mm/s", speed),
+                                                   ("目标 X mm", target_x),
+                                                   ("目标 Y mm", target_y))):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(form, textvariable=variable, width=16).grid(row=row, column=1, padx=8)
+
+        def move_xy_manual():
+            try:
+                cfg = cfg_from_form()
+                velocity = float(speed.get())
+                target = (float(target_x.get()), float(target_y.get()))
+                if not math.isfinite(velocity) or not .001 <= velocity <= 500:
+                    raise ValueError("移动速度必须在 0.001~500 mm/s")
+                if not all(math.isfinite(v) for v in target):
+                    raise ValueError("目标坐标必须是有限数")
+                cancel.clear()
+                for button in buttons + checkboxes:
+                    button.configure(state="disabled")
+                tasks.put(("move_xy_manual", cfg, {"target": target, "speed": velocity}))
+                result.set("已发送移动命令")
+            except Exception as exc:
+                messagebox.showerror("XY 位移台", str(exc), parent=top)
+
+        ttk.Button(top, text="移动到目标位置", command=move_xy_manual).pack(pady=8)
+        def sync_xy_mpos():
+            if not messagebox.askyesno(
+                    "确认校准", "仅在已经确认机械位置正确且位移台空闲时执行。\n"
+                                "是否将当前 MPOS 对齐到 DPOS？", parent=top):
+                return
+            try:
+                cfg = cfg_from_form()
+                cancel.clear()
+                tasks.put(("sync_xy_mpos", cfg, None))
+                result.set("已发送 MPOS 校准命令")
+            except Exception as exc:
+                messagebox.showerror("XY 校准", str(exc), parent=top)
+        ttk.Button(top, text="MPOS 对齐 DPOS", command=sync_xy_mpos).pack(pady=2)
+        ttk.Label(top, textvariable=result, foreground="gray").pack()
+
+        def refresh_xy():
+            if not top.winfo_exists():
+                return
+            try:
+                with stage_lock:
+                    active_stage = stage_state["stage"]
+                    active_reader = stage_state["reader"]
+                if active_reader is None:
+                    current.set("当前坐标：未连接")
+                else:
+                    sample = active_reader.latest()
+                    dpos = active_stage.get_dpositions()
+                    idle = active_stage.is_idle()
+                    current.set(f"MPOS(校正)：X={sample['x_mm']:.4f}，Y={sample['y_mm']:.4f} mm\n"
+                                f"DPOS：X={dpos[0]:.4f}，Y={dpos[1]:.4f} mm；状态={'空闲' if idle else '运动中'}")
+            except Exception as exc:
+                current.set(f"当前坐标：读取失败（{exc}）")
+            top.after(200, refresh_xy)
+
+        refresh_xy()
+
     def stage_worker():
         stage = reader = None
         try:
@@ -902,6 +1012,35 @@ def gui(args):
                         messages.put(("status", "已断开"))
                     elif action == "demo":
                         messages.put(("result", demo_result(cfg)))
+                    elif action == "move_xy_manual":
+                        stage, reader = get_stage(cfg)
+                        target = value["target"]
+                        try:
+                            stage.move(target, value["speed"], cfg.xy_acceleration)
+                            began = time.perf_counter()
+                            while True:
+                                if cancel.is_set():
+                                    raise RuntimeError("XY 移动已停止")
+                                sample = reader.latest()
+                                if (math.dist((sample["x_mm"], sample["y_mm"]), target) <= cfg.xy_tolerance_mm
+                                        and stage.is_idle()):
+                                    messages.put(("status", f"XY 已到达 ({target[0]:g}, {target[1]:g}) mm"))
+                                    break
+                                if time.perf_counter() - began > cfg.scan_timeout_s:
+                                    dpos = stage.get_dpositions()
+                                    messages.put(("status", f"XY timeout target={target} MPOS=({sample['x_mm']:.4f},{sample['y_mm']:.4f}) DPOS=({dpos[0]:.4f},{dpos[1]:.4f})"))
+                                    raise TimeoutError("XY 移动到目标位置超时")
+                                cancel.wait(.005)
+                        except BaseException:
+                            stage.stop()
+                            raise
+                    elif action == "sync_xy_mpos":
+                        stage, reader = get_stage(cfg)
+                        try:
+                            aligned = stage.sync_mpos_to_dpos()
+                            messages.put(("status", f"XY MPOS 已对齐 DPOS：X={aligned[0]:.4f}，Y={aligned[1]:.4f} mm"))
+                        except BaseException:
+                            raise
                     elif action in ("move_xy_start", "move_xy_end"):
                         stage, reader = get_stage(cfg)
                         target = ((cfg.xy_start_x, cfg.xy_start_y) if action == "move_xy_start"

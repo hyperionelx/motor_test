@@ -332,7 +332,8 @@ class NativeBoundaryTests(unittest.TestCase):
         dll, calls = self.make_dll()
         stage = XYStage("dummy.dll", dll=dll)
         stage.connect("192.168.0.11")
-        self.assertEqual(stage.get_positions(), (3., 3.))
+        # MPOS=3、DPOS=99 时，应用层反馈应校正到 DPOS 坐标。
+        self.assertEqual(stage.get_positions(), (99., 99.))
         self.assertEqual(dll.ZAux_Direct_MoveAbs.argtypes[0], ctypes.c_void_p)
         self.assertEqual(stage.handle.value, 1234)
         stage.move((10., 20.), 5., 1000.)
