@@ -413,6 +413,97 @@ def run_test(link, cfg, cancel, update=lambda message: None):
     return result
 
 
+def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
+                          update=lambda message: None):
+    """按 mapping 曲线等时间采样，执行不联动 XY 的 GOTO 测试。"""
+    if link.latest is None or time.perf_counter() - link.latest["host_abs_s"] > 0.2:
+        raise RuntimeError("没有新鲜的位置遥测")
+    if not math.isfinite(step_ms) or not 5 <= step_ms <= 10000:
+        raise ValueError("曲线测试每步时间必须在 5~10000 ms")
+    if not isinstance(steps, int) or not 1 <= steps <= 10000:
+        raise ValueError("曲线测试步数必须在 1~10000")
+    start_distance, end_distance = curve.distance_mm[0], curve.distance_mm[-1]
+    span = end_distance - start_distance
+    dt = step_ms / 1000
+    current_start = link.latest["position_um"]
+    curve_start_z = curve.at(start_distance)[0]
+    targets = [current_start + curve.at(start_distance + span * i / steps)[0] - curve_start_z
+               for i in range(steps + 1)]
+    if any(not cfg.min_um <= target <= cfg.max_um for target in targets):
+        raise ValueError("mapping 曲线目标超出 Z 轴软限位")
+    path_distance = sum(abs(b - a) for a, b in zip(targets, targets[1:]))
+    acceleration, deceleration = link.read_motion_limits()
+    vmax = link.max_velocity
+    peak = min(vmax, math.sqrt(2 * path_distance /
+                                (1 / acceleration + 1 / deceleration))) if path_distance else 0.
+    accel_time, decel_time = peak / acceleration, peak / deceleration
+    accel_distance = .5 * peak * (accel_time + decel_time)
+    minimum_time = (accel_time + decel_time if accel_distance >= path_distance else
+                    accel_time + decel_time + (path_distance - accel_distance) / peak)
+    requested_time = steps * dt
+    if requested_time + 1e-9 < minimum_time:
+        raise ValueError(f"曲线总时间 {requested_time:.3f} s 小于 Z 轴理论最短时间 "
+                         f"{minimum_time:.3f} s；建议每步至少 "
+                         f"{minimum_time / steps * 1000:.1f} ms")
+    plan = [dict(step=i, scheduled_send_s=i * dt, deadline_s=i * dt,
+                 target_um=targets[i]) for i in range(steps + 1)]
+    test_cfg = vars(cfg).copy()
+    test_cfg.update(interval_ms=step_ms, steps=len(plan),
+                    step_um=(targets[-1] - targets[0]) if targets[-1] != targets[0] else 1.)
+    t0 = time.perf_counter()
+    sample_begin = max(0, len(link.samples) - 20)
+    initial_bad, initial_lost = link.decoder.bad_frames, link.lost_samples
+    commands = []
+    result = dict(config=test_cfg, start_um=targets[0], origin_abs_s=t0,
+                  planned=plan, commands=commands, evaluation_plan=plan,
+                  reference_duration_s=steps * dt, curve_test=True,
+                  status="running", firmware=link.info, max_velocity_um_s=link.max_velocity)
+    next_index = 0
+    display_at = 0.0
+    end_s = steps * dt + cfg.tail_ms / 1000
+    try:
+        while time.perf_counter() - t0 < end_s:
+            if cancel.is_set():
+                result["status"] = "cancelled"
+                break
+            link.poll()
+            now = time.perf_counter()
+            if now - link.latest["host_abs_s"] > max(0.2, 3 * link.sample_ms / 1000):
+                raise TimeoutError("位置遥测中断")
+            if next_index < len(plan) and now - t0 >= plan[next_index]["scheduled_send_s"]:
+                late = now - t0 - plan[next_index]["scheduled_send_s"]
+                if late >= dt:
+                    raise RuntimeError("曲线 GOTO 发送晚了一个完整周期，已停止以避免突发补发")
+                rec = plan[next_index].copy()
+                commands.append(rec)
+                link.goto(rec["target_um"], rec)
+                next_index += 1
+            if now - display_at >= 0.1:
+                update(f"曲线 GOTO：位置 {link.latest['position_um']:.3f} μm；"
+                       f"指令 {next_index}/{len(plan)}")
+                display_at = now
+            cancel.wait(0.001)
+        else:
+            result["status"] = "complete"
+        if result["status"] == "complete" and any(c["ack_abs_s"] is None for c in commands):
+            raise TimeoutError("曲线 GOTO 测试末尾存在未确认命令")
+    except Exception as exc:
+        result["status"], result["error"] = "failed", str(exc)
+    finally:
+        try:
+            key = link.stop()
+            if key is not None:
+                link.until(lambda: key not in link.pending, 0.6)
+        except Exception as exc:
+            result["stop_error"] = str(exc)
+            result["status"] = "failed"
+        result["samples"] = link.samples[sample_begin:]
+        result["events"] = [e for e in link.events if e["host_abs_s"] >= t0]
+        result["bad_frames"] = link.decoder.bad_frames - initial_bad
+        result["lost_samples"] = link.lost_samples - initial_lost
+    return result
+
+
 def interpolate(times, positions, at, max_gap):
     i = bisect.bisect_left(times, at)
     if i < len(times) and abs(times[i] - at) < 1e-9:
@@ -528,6 +619,96 @@ def draw(analysis, title, figure=None):
     return fig
 
 
+def draw_mapping_ideal(curve, step_ms, steps, figure=None):
+    """绘制不联动 XY 的 mapping 理想固定步长测试曲线。"""
+    from matplotlib.figure import Figure
+    if not math.isfinite(step_ms) or step_ms <= 0:
+        raise ValueError("每一步时间必须为正数")
+    if not isinstance(steps, int) or steps < 1:
+        raise ValueError("步数必须为正整数")
+    start_distance, end_distance = curve.distance_mm[0], curve.distance_mm[-1]
+    span = end_distance - start_distance
+    times = [i * step_ms / 1000 for i in range(steps + 1)]
+    distances = [start_distance + span * i / steps for i in range(steps + 1)]
+    curve_start_z = curve.at(start_distance)[0]
+    targets = [curve.at(distance)[0] - curve_start_z for distance in distances]
+    velocities = []
+    dt = step_ms / 1000
+    for i in range(len(targets)):
+        if i == 0:
+            velocity = (targets[1] - targets[0]) / dt if len(targets) > 1 else 0.
+        elif i == len(targets) - 1:
+            velocity = (targets[i] - targets[i - 1]) / dt
+        else:
+            velocity = (targets[i + 1] - targets[i - 1]) / (2 * dt)
+        velocities.append(velocity)
+    virtual_speed = span / (step_ms * steps / 1000)
+    fig = figure or Figure(figsize=(12, 4.5), layout="constrained")
+    fig.clear()
+    ax1, ax2, ax3 = fig.subplots(1, 3)
+    ax1.plot(times, targets, "o-", ms=3, label="Set position")
+    ax1.plot(times, targets, "--", label="Ideal reported position")
+    ax1.set(xlabel="Time (s)", ylabel="Relative position (um)", title="Relative set / reported position")
+    ax1.legend()
+    ax2.plot(times, velocities, "o-", ms=3, label="Reported velocity")
+    ax2.plot(times, velocities, "--", label="Reference velocity")
+    ax2.set(xlabel="Time (s)", ylabel="Velocity (um/s)", title="Position difference / MCU dt")
+    ax2.legend()
+    ax3.plot(times, [0.] * len(times), "o-", ms=3)
+    ax3.axhline(0, color="gray", linestyle="--")
+    ax3.set(xlabel="Time (s)", ylabel="Equivalent lag (ms)", title="Positive = behind; negative = ahead")
+    for ax in (ax1, ax2, ax3):
+        ax.grid(alpha=0.25)
+    fig.suptitle(f"Ideal mapping test curve | {steps} steps × {step_ms:g} ms | "
+                 f"virtual distance speed {virtual_speed:g} mm/s")
+    return fig
+
+
+def draw_curve_goto_result(analysis, title, figure=None):
+    """曲线 GOTO 测试结果：保留原三图，并增加时间-位置对比图。"""
+    from matplotlib.figure import Figure
+    fig = figure or Figure(figsize=(16, 4.5), layout="constrained")
+    fig.clear()
+    ax1, ax2, ax3, ax4 = fig.subplots(1, 4)
+    steps, samples = analysis["steps"], analysis["samples"]
+    start_um = analysis.get("curve_start_um", 0.)
+    ax1.plot([r["target_um"] for r in steps],
+             [r["actual_um"] if r["actual_um"] is not None else math.nan for r in steps],
+             "o-", ms=3)
+    if steps:
+        ends = [min(r["target_um"] for r in steps), max(r["target_um"] for r in steps)]
+        ax1.plot(ends, ends, "--", color="gray", label="y = x")
+        ax1.legend()
+    ax1.set(xlabel="Set position (um)", ylabel="Reported position (um)",
+            title="Set / reported")
+
+    ax2.plot([s["time_s"] for s in samples],
+             [s["velocity_um_s"] if s["velocity_um_s"] is not None else math.nan for s in samples],
+             label="Reported velocity")
+    ax2.set(xlabel="Time (s)", ylabel="Velocity (um/s)", title="Reported velocity")
+
+    ax3.plot([r["deadline_s"] for r in steps],
+             [r["delay_ms"] if r["delay_ms"] is not None else math.nan for r in steps],
+             "o-", ms=3)
+    ax3.axhline(0, color="gray", linestyle="--")
+    ax3.set(xlabel="Time (s)", ylabel="Equivalent lag (ms)", title="Equivalent lag")
+
+    ax4.plot([r["deadline_s"] for r in steps],
+             [r["target_um"] - start_um for r in steps],
+             color="tab:orange", linestyle="-", linewidth=1.8, label="Ideal curve")
+    ax4.plot([s["time_s"] for s in samples],
+             [s["position_um"] - start_um for s in samples],
+             color="tab:blue", linestyle=":", marker="o", markersize=2,
+             label="Actual reported")
+    ax4.set(xlabel="Time (s)", ylabel="Relative position / distance (um)",
+            title="Ideal curve vs actual")
+    ax4.legend()
+    for ax in (ax1, ax2, ax3, ax4):
+        ax.grid(alpha=0.25)
+    fig.suptitle(title)
+    return fig
+
+
 def save_result(result, out_dir):
     analysis = analyze(result)
     output = Path(out_dir) / (time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1000000:06d}")
@@ -620,6 +801,9 @@ def gui(args):
     stage_lock = threading.Lock()
     cancel, shutdown = threading.Event(), threading.Event()
     motor_done = threading.Event()
+    ideal_page_state = {"page": None, "figure": None, "canvas": None,
+                        "status": None, "z_position": None, "z_limit": None,
+                        "start": None}
     status = tk.StringVar(value="未连接；请先填写实际机械软限位")
     frame = ttk.Frame(root, padding=10)
     frame.pack(fill="x")
@@ -797,8 +981,170 @@ def gui(args):
     b = ttk.Button(stage_box, text="预览 mapping", command=preview_mapping)
     b.grid(row=1, column=3)
     buttons.append(b)
+    def open_mapping_ideal_page():
+        top = tk.Toplevel(root)
+        top.title("mapping 理想固定步长测试（不联动 XY）")
+        top.geometry("1280x620")
+        top.transient(root)
+
+        curve_state = {"curve": None, "path": ""}
+        ideal_page_state.update(page=top)
+        controls = ttk.Frame(top, padding=8)
+        controls.pack(fill="x")
+        step_ms_var = tk.StringVar(value=str(args.interval_ms))
+        steps_var = tk.StringVar(value=str(args.steps))
+        file_var = tk.StringVar(value="尚未导入 mapping")
+        test_status = tk.StringVar(value="请先导入 mapping 曲线")
+        z_position = tk.StringVar(value="当前 Z 坐标：未连接")
+        z_limit = tk.StringVar(value="Z 固件最大速度：未连接")
+        ttk.Label(controls, text="每一步时间 ms").pack(side="left")
+        ttk.Entry(controls, textvariable=step_ms_var, width=10).pack(side="left", padx=5)
+        ttk.Label(controls, text="步数").pack(side="left", padx=(12, 0))
+        ttk.Entry(controls, textvariable=steps_var, width=10).pack(side="left", padx=5)
+        ttk.Label(controls, textvariable=file_var).pack(side="left", padx=12)
+
+        xy_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
+        xy_controls.pack(fill="x")
+        xy_start_x_var = tk.StringVar(value=str(args.xy_start_x))
+        xy_start_y_var = tk.StringVar(value=str(args.xy_start_y))
+        xy_end_x_var = tk.StringVar(value=str(args.xy_end_x))
+        xy_end_y_var = tk.StringVar(value=str(args.xy_end_y))
+        analog_speed = tk.StringVar(value="类比 XY 速度：-- mm/s；等效 Z 速度：-- μm/s")
+        ttk.Label(xy_controls, text="起点 X mm").pack(side="left")
+        ttk.Entry(xy_controls, textvariable=xy_start_x_var, width=9).pack(side="left", padx=3)
+        ttk.Label(xy_controls, text="起点 Y mm").pack(side="left", padx=(8, 0))
+        ttk.Entry(xy_controls, textvariable=xy_start_y_var, width=9).pack(side="left", padx=3)
+        ttk.Label(xy_controls, text="终点 X mm").pack(side="left", padx=(8, 0))
+        ttk.Entry(xy_controls, textvariable=xy_end_x_var, width=9).pack(side="left", padx=3)
+        ttk.Label(xy_controls, text="终点 Y mm").pack(side="left", padx=(8, 0))
+        ttk.Entry(xy_controls, textvariable=xy_end_y_var, width=9).pack(side="left", padx=3)
+        ttk.Label(xy_controls, textvariable=analog_speed).pack(side="left", padx=12)
+
+        def refresh_analog_speed(*_):
+            try:
+                start = (float(xy_start_x_var.get()), float(xy_start_y_var.get()))
+                end = (float(xy_end_x_var.get()), float(xy_end_y_var.get()))
+                total_time = float(step_ms_var.get()) * int(steps_var.get()) / 1000
+                distance = math.dist(start, end)
+                if not math.isfinite(total_time) or total_time <= 0:
+                    raise ValueError
+                curve = curve_state["curve"]
+                if curve is None:
+                    raise ValueError
+                steps = int(steps_var.get())
+                if steps < 1:
+                    raise ValueError
+                curve_start = curve.distance_mm[0]
+                curve_span = curve.distance_mm[-1] - curve_start
+                z_values = [curve.at(curve_start + curve_span * i / steps)[0]
+                             for i in range(steps + 1)]
+                z_distance = sum(abs(b - a) for a, b in zip(z_values, z_values[1:]))
+                analog_speed.set(f"XY总距离：{distance:.4f} mm；类比 XY 速度：{distance / total_time:.4f} mm/s；"
+                                 f"Z总路径：{z_distance:.3f} μm；等效 Z 速度：{z_distance / total_time:.3f} μm/s")
+            except (ValueError, TypeError):
+                analog_speed.set("类比 XY 速度：-- mm/s；等效 Z 速度：-- μm/s")
+
+        for variable in (step_ms_var, steps_var, xy_start_x_var, xy_start_y_var,
+                         xy_end_x_var, xy_end_y_var):
+            variable.trace_add("write", refresh_analog_speed)
+        refresh_analog_speed()
+
+        figure = Figure(figsize=(12, 4.8), layout="constrained")
+        canvas = FigureCanvasTkAgg(figure, master=top)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        ideal_page_state.update(figure=figure, canvas=canvas, status=test_status,
+                                z_position=z_position, z_limit=z_limit)
+
+        def redraw():
+            curve = curve_state["curve"]
+            if curve is None:
+                raise ValueError("请先导入 mapping 曲线")
+            step_ms = float(step_ms_var.get())
+            steps = int(steps_var.get())
+            draw_mapping_ideal(curve, step_ms, steps, figure)
+            canvas.draw_idle()
+
+        def import_curve_for_ideal():
+            path = filedialog.askopenfilename(
+                title="导入理想测试 mapping 曲线",
+                filetypes=[("Mapping", "*.txt *.csv *.tsv"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                curve_state["curve"] = MappingCurve.load(path)
+                curve_state["path"] = str(Path(path).resolve())
+                file_var.set(f"{Path(path).name}；{len(curve_state['curve'].distance_mm)}点；"
+                             f"距离 {curve_state['curve'].span_mm:g} mm")
+                redraw()
+            except Exception as exc:
+                messagebox.showerror("导入理想测试 mapping", str(exc), parent=top)
+
+        ttk.Button(controls, text="导入 mapping", command=import_curve_for_ideal).pack(side="left", padx=5)
+        ttk.Button(controls, text="绘制曲线", command=lambda: _show_error(redraw, top)).pack(side="left", padx=5)
+        def start_curve_test():
+            try:
+                curve = curve_state["curve"]
+                if curve is None:
+                    raise ValueError("请先导入 mapping 曲线")
+                step_ms = float(step_ms_var.get())
+                steps = int(steps_var.get())
+                if not math.isfinite(step_ms) or not 5 <= step_ms <= 10000:
+                    raise ValueError("每一步时间必须在 5~10000 ms")
+                if not 1 <= steps <= 10000:
+                    raise ValueError("步数必须在 1~10000")
+                cfg = argparse.Namespace(**vars(args))
+                cancel.clear()
+                start_button.configure(state="disabled")
+                test_status.set("已开始曲线 GOTO 测试")
+                tasks.put(("run_mapping_goto", cfg,
+                           {"curve": curve, "step_ms": step_ms, "steps": steps}))
+            except Exception as exc:
+                messagebox.showerror("曲线 GOTO 测试", str(exc), parent=top)
+
+        def stop_curve_test():
+            cancel.set()
+            test_status.set("正在停止曲线测试…")
+
+        start_button = ttk.Button(controls, text="开始曲线 GOTO 测试", command=start_curve_test)
+        start_button.pack(side="left", padx=5)
+        stop_button = ttk.Button(controls, text="停止曲线测试", command=stop_curve_test)
+        stop_button.pack(side="left", padx=5)
+        def move_z_zero():
+            try:
+                cfg = argparse.Namespace(**vars(args))
+                cancel.clear()
+                test_status.set("已发送 Z 回零命令")
+                tasks.put(("move_z_zero", cfg, None))
+            except Exception as exc:
+                messagebox.showerror("Z 马达回零", str(exc), parent=top)
+
+        ttk.Button(controls, text="Z 马达回到 0", command=move_z_zero).pack(side="left", padx=5)
+        ideal_page_state["start"] = start_button
+        ttk.Label(top, textvariable=z_position, font=("TkDefaultFont", 11)).pack(anchor="w", padx=10)
+        ttk.Label(top, textvariable=z_limit, foreground="gray").pack(anchor="w", padx=10)
+        ttk.Label(top, textvariable=test_status, foreground="gray").pack(anchor="w", padx=10)
+        ttk.Label(top, text="总时间 = 每一步时间 × 步数；曲线高度按相对位移处理，当前 Z 位置作为起点；"
+                           "mapping 总距离在总时间内按距离比例逐步取样。",
+                  foreground="gray").pack(anchor="w", padx=10, pady=(0, 5))
+
+        def page_closed():
+            ideal_page_state.update(page=None, figure=None, canvas=None, status=None,
+                                    z_position=None, z_limit=None, start=None)
+            top.destroy()
+        top.protocol("WM_DELETE_WINDOW", page_closed)
+
+    def _show_error(action, parent):
+        try:
+            action()
+        except Exception as exc:
+            messagebox.showerror("理想测试曲线", str(exc), parent=parent)
+
+    # 保留原按钮位置，但打开独立页面；导入和参数都在子页面内完成。
+    b = ttk.Button(stage_box, text="理想测试曲线", command=open_mapping_ideal_page)
+    b.grid(row=1, column=4)
+    buttons.append(b)
     box = ttk.Checkbutton(stage_box, text="用实际 XY + mapping 替换固定步长直线", variable=mapping_enabled)
-    box.grid(row=1, column=4, columnspan=4, sticky="w")
+    box.grid(row=1, column=5, columnspan=3, sticky="w")
     checkboxes.append(box)
     xy_fields = [("xy_start_x", "起点 X mm"), ("xy_start_y", "起点 Y mm"),
                  ("xy_end_x", "终点 X mm"), ("xy_end_y", "终点 Y mm"),
@@ -988,6 +1334,8 @@ def gui(args):
                             if now - report_at >= 0.2 and link.latest:
                                 messages.put(("status", f"位置 {link.latest['position_um']:.3f} μm；"
                                               f"GOTO 当前速度上限 {link.max_velocity:g} μm/s"))
+                                messages.put(("curve_z_position", link.latest["position_um"]))
+                                messages.put(("curve_z_limit", link.max_velocity))
                                 report_at = now
                             # 手动操作只需最新位置，试验原始数据在 run_test 内保留。
                             if len(link.samples) > 2000:
@@ -1012,6 +1360,38 @@ def gui(args):
                         messages.put(("status", "已断开"))
                     elif action == "demo":
                         messages.put(("result", demo_result(cfg)))
+                    elif action == "run_mapping_goto":
+                        if link is None:
+                            raise RuntimeError("请先连接 STM32")
+                        value_curve = value["curve"]
+                        result = run_mapping_goto_test(link, cfg, value_curve,
+                                                        value["step_ms"], value["steps"],
+                                                        cancel,
+                                                        lambda message: messages.put(("curve_status", message)))
+                        messages.put(("curve_result", result))
+                    elif action == "move_z_zero":
+                        if link is None:
+                            raise RuntimeError("请先连接 STM32")
+                        if link.latest is None or link.latest["state"] != 0:
+                            raise RuntimeError("Z 马达必须处于 IDLE 状态才能回到 0")
+                        if not cfg.min_um <= 0 <= cfg.max_um:
+                            raise RuntimeError("Z=0 超出当前软件软限位")
+                        key = link.goto(0.)
+                        link.until(lambda: key not in link.pending, .6)
+                        deadline = time.perf_counter() + max(
+                            2., 3. * abs(link.latest["position_um"]) /
+                            max(1.28, link.max_velocity) + 1.)
+                        while True:
+                            if cancel.is_set():
+                                raise RuntimeError("Z 回零已停止")
+                            link.poll()
+                            if (abs(link.latest["position_um"]) <= max(.5, cfg.deadband_um)
+                                    and link.latest["state"] == 0):
+                                messages.put(("curve_status", "Z 马达已回到 0 位置"))
+                                break
+                            if time.perf_counter() >= deadline:
+                                raise TimeoutError("Z 马达回到 0 位置超时")
+                            cancel.wait(.005)
                     elif action == "move_xy_manual":
                         stage, reader = get_stage(cfg)
                         target = value["target"]
@@ -1134,8 +1514,37 @@ def gui(args):
             if kind == "ready":
                 for button in buttons + checkboxes:
                     button.configure(state="normal")
+                if ideal_page_state["start"] is not None and ideal_page_state["page"] is not None:
+                    ideal_page_state["start"].configure(state="normal")
             elif kind == "xy_status":
                 stage_status.set(value)
+            elif kind == "curve_status":
+                if ideal_page_state["status"] is not None:
+                    ideal_page_state["status"].set(value)
+            elif kind == "curve_z_position":
+                if ideal_page_state["z_position"] is not None:
+                    ideal_page_state["z_position"].set(f"当前 Z 坐标：{value:.3f} μm")
+            elif kind == "curve_z_limit":
+                if ideal_page_state["z_limit"] is not None:
+                    ideal_page_state["z_limit"].set(f"Z 固件最大速度：{value:g} μm/s（只读）")
+            elif kind == "curve_result":
+                try:
+                    result = value
+                    analysis = analyze(result)
+                    analysis["curve_start_um"] = result.get("start_um", 0.)
+                    if ideal_page_state["figure"] is not None:
+                        draw_curve_goto_result(analysis, "曲线 GOTO 测试结果",
+                                               ideal_page_state["figure"])
+                        ideal_page_state["canvas"].draw_idle()
+                    if ideal_page_state["status"] is not None:
+                        error_text = result.get("error") or result.get("stop_error") or ""
+                        ideal_page_state["status"].set(
+                            f"测试{result['status']}；有效点 {analysis['valid_step_count']}；"
+                            f"最大误差 {analysis.get('max_abs_error_um')}"
+                            f"{('；原因：' + error_text) if error_text else ''}")
+                except Exception as exc:
+                    if ideal_page_state["status"] is not None:
+                        ideal_page_state["status"].set(f"曲线测试结果分析失败：{exc}")
             elif kind == "error":
                 status.set(value)
                 nonlocal_status_hold[0] = time.perf_counter() + 8
