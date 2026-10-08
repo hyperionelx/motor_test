@@ -1,0 +1,10 @@
+# physical feed-forward trace
+# distance is measured from the scan start (mm)
+# start_xy_mm 0 -40
+# end_xy_mm 0 40
+distance_mm	x_mm	y_mm	target_z_um	actual_z_um
+0	0	-40	140	
+20	0	-20	70	
+40	0	0	0	
+60	0	20	-70	
+80	0	40	-140	
