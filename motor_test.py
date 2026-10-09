@@ -445,8 +445,11 @@ def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
         raise ValueError(f"曲线总时间 {requested_time:.3f} s 小于 Z 轴理论最短时间 "
                          f"{minimum_time:.3f} s；建议每步至少 "
                          f"{minimum_time / steps * 1000:.1f} ms")
-    plan = [dict(step=i, scheduled_send_s=i * dt, deadline_s=i * dt,
-                 target_um=targets[i]) for i in range(steps + 1)]
+    # targets[0] 只是当前 Z 位置的参考起点，不发送一次无位移指令。
+    # 第一个实际曲线目标从 t=0 发送；deadline 保持与原 GOTO 的
+    # “发送时间领先一个周期、按下一周期评价”定义一致。
+    plan = [dict(step=i + 1, scheduled_send_s=i * dt, deadline_s=(i + 1) * dt,
+                 target_um=targets[i + 1]) for i in range(steps)]
     test_cfg = vars(cfg).copy()
     test_cfg.update(interval_ms=step_ms, steps=len(plan),
                     step_um=(targets[-1] - targets[0]) if targets[-1] != targets[0] else 1.)
@@ -504,6 +507,143 @@ def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
     return result
 
 
+def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
+                              update=lambda message: None):
+    """不联动 XY，按 mapping 曲线时间参数执行 A/B 连续控制。"""
+    if mode not in ("VELOCITY_TRIM", "TRACK_POSITION_LEAD"):
+        raise ValueError("曲线连续测试模式无效")
+    if link.latest is None or time.perf_counter() - link.latest["host_abs_s"] > 0.2:
+        raise RuntimeError("没有新鲜的位置遥测")
+    if not math.isfinite(step_ms) or not 5 <= step_ms <= 10000:
+        raise ValueError("曲线测试每步时间必须在 5~10000 ms")
+    if not isinstance(steps, int) or not 1 <= steps <= 10000:
+        raise ValueError("曲线测试步数必须在 1~10000")
+    if mode == "TRACK_POSITION_LEAD" and not link.info.get("caps", 0) & 8:
+        raise RuntimeError("设备未声明 TRACK 能力，无法启用方案 B")
+    if not 5 <= cfg.control_ms <= 50:
+        raise ValueError("连续控制周期必须在 5~50 ms")
+    if cfg.sample_ms > cfg.control_ms:
+        raise ValueError("连续模式的遥测周期不得超过控制周期")
+
+    start_distance, end_distance = curve.distance_mm[0], curve.distance_mm[-1]
+    span = end_distance - start_distance
+    total_time = steps * step_ms / 1000
+    start_um = link.latest["position_um"]
+    curve_start_z = curve.at(start_distance)[0]
+
+    def reference(t, lead_s=0.):
+        ratio = min(1., max(0., (t + lead_s) / total_time))
+        distance = start_distance + span * ratio
+        z, slope = curve.at(distance)
+        target = start_um + z - curve_start_z
+        velocity = slope * span / total_time if total_time else 0.
+        if ratio >= 1. and lead_s >= 0:
+            velocity = 0.
+        return target, velocity
+
+    targets = [reference(i * step_ms / 1000)[0] for i in range(steps + 1)]
+    reference_peak = max((abs(reference(i * step_ms / 1000)[1])
+                          for i in range(steps + 1)), default=0.)
+    if any(not cfg.min_um <= target <= cfg.max_um for target in targets):
+        raise ValueError("mapping 曲线目标超出 Z 轴软限位")
+    acceleration, deceleration = link.read_motion_limits()
+    path_distance = sum(abs(b - a) for a, b in zip(targets, targets[1:]))
+    vmax = link.max_velocity
+    peak = min(vmax, math.sqrt(2 * path_distance /
+                                (1 / acceleration + 1 / deceleration))) if path_distance else 0.
+    accel_time, decel_time = peak / acceleration, peak / deceleration
+    accel_distance = .5 * peak * (accel_time + decel_time)
+    minimum_time = (accel_time + decel_time if accel_distance >= path_distance else
+                    accel_time + decel_time + (path_distance - accel_distance) / peak)
+    if total_time + 1e-9 < minimum_time:
+        raise ValueError(f"曲线总时间 {total_time:.3f} s 小于 Z 轴理论最短时间 "
+                         f"{minimum_time:.3f} s；建议每步至少 "
+                         f"{minimum_time / steps * 1000:.1f} ms")
+
+    test_cfg = vars(cfg).copy()
+    test_cfg.update(interval_ms=step_ms, steps=0,
+                    step_um=(targets[-1] - targets[0]) if targets[-1] != targets[0] else 1.)
+    t0 = time.perf_counter()
+    sample_begin = max(0, len(link.samples) - 20)
+    initial_bad, initial_lost = link.decoder.bad_frames, link.lost_samples
+    commands = []
+    result = dict(config=test_cfg, start_um=start_um, origin_abs_s=t0,
+                  planned=[], commands=commands, evaluation_plan=commands,
+                  reference_duration_s=total_time, curve_test=True, mode=mode,
+                  reference_source="CURVE", status="running", firmware=link.info,
+                  max_velocity_um_s=link.max_velocity)
+    period = cfg.control_ms / 1000
+    next_send, sequence, display_at = 0., 0, 0.
+    try:
+        while time.perf_counter() - t0 < total_time + cfg.tail_ms / 1000:
+            if cancel.is_set():
+                result["status"] = "cancelled"
+                break
+            link.poll()
+            now = time.perf_counter()
+            if now - link.latest["host_abs_s"] > max(.2, 3 * link.sample_ms / 1000):
+                raise TimeoutError("位置遥测中断")
+            if now - t0 >= next_send and next_send <= total_time:
+                late = now - t0 - next_send
+                if late >= period:
+                    raise RuntimeError("曲线连续控制发送晚了一个完整周期，已停止")
+                target, ideal_velocity = reference(next_send)
+                position = link.latest["position_um"]
+                error = target - position
+                if abs(error) > cfg.max_following_um:
+                    raise RuntimeError(f"Z 跟随误差超过停止阈值：{error:.3f} μm")
+                rec = dict(step=sequence, scheduled_send_s=next_send,
+                           deadline_s=next_send, target_um=target,
+                           reference_velocity_um_s=ideal_velocity,
+                           following_error_um=error)
+                if mode == "VELOCITY_TRIM":
+                    effective = math.copysign(max(0., abs(error) - cfg.deadband_um), error)
+                    # 使用整条曲线的参考峰值作为 A 方案微调上限；
+                    # 否则曲线末端理想速度为 0 时，位置误差将无法修正。
+                    bound = reference_peak * cfg.trim_percent / 100
+                    correction = min(abs(cfg.kp_s * effective), bound)
+                    correction = math.copysign(correction, cfg.kp_s * effective)
+                    command_velocity = ideal_velocity + correction
+                    if abs(command_velocity) > vmax + 1e-6:
+                        raise RuntimeError("A 方案所需 Z 速度超过固件上限")
+                    rec.update(command_velocity_um_s=command_velocity,
+                               correction_velocity_um_s=correction)
+                    link.velocity(command_velocity, rec)
+                else:
+                    lead_target, lead_velocity = reference(next_send, cfg.lead_ms / 1000)
+                    sequence = (sequence + 1) & 0xFFFF
+                    rec.update(command_position_um=lead_target,
+                               command_velocity_um_s=lead_velocity,
+                               position_lead_um=lead_target - target)
+                    link.track(lead_target, lead_velocity, sequence,
+                               start=(sequence == 1), record=rec)
+                commands.append(rec)
+                next_send += period
+            if now - display_at >= 0.1:
+                update(f"{mode}：位置 {link.latest['position_um']:.3f} μm；"
+                       f"目标 {next_send:.3f} s")
+                display_at = now
+            cancel.wait(.001)
+        else:
+            result["status"] = "complete"
+    except Exception as exc:
+        result["status"], result["error"] = "failed", str(exc)
+    finally:
+        try:
+            key = link.stop()
+            if key is not None:
+                link.until(lambda: key not in link.pending, .6)
+        except Exception as exc:
+            result["stop_error"] = str(exc)
+            result["status"] = "failed"
+        result["config"]["steps"] = len(commands)
+        result["samples"] = link.samples[sample_begin:]
+        result["events"] = [e for e in link.events if e["host_abs_s"] >= t0]
+        result["bad_frames"] = link.decoder.bad_frames - initial_bad
+        result["lost_samples"] = link.lost_samples - initial_lost
+    return result
+
+
 def interpolate(times, positions, at, max_gap):
     i = bisect.bisect_left(times, at)
     if i < len(times) and abs(times[i] - at) < 1e-9:
@@ -545,16 +685,35 @@ def analyze(result):
         average = None  # 静止、近零平均速度不产生无穷大或伪零延时。
     direction = 1 if cfg["step_um"] > 0 else -1
     rows = []
+    previous_target = None
+    previous_deadline = None
     for command in result.get("evaluation_plan", result["commands"]):
         row = command.copy()
         deadline = row["deadline_s"]
         actual = interpolate(ts, zs, deadline, gap)
         error = row["target_um"] - actual if actual is not None else None
+        if result.get("curve_test"):
+            # 导入曲线的速度是局部变化的，不能用整条曲线的平均速度
+            # 把位置误差换算成等效延时。
+            reference_velocity = row.get("reference_velocity_um_s")
+            if reference_velocity is None and previous_target is not None:
+                reference_dt = deadline - previous_deadline
+                if reference_dt > 0:
+                    reference_velocity = (row["target_um"] - previous_target) / reference_dt
+            if reference_velocity is not None and abs(reference_velocity) > 1e-9:
+                delay_ms = 1000 * error / reference_velocity if error is not None else None
+                absolute_delay_ms = (1000 * abs(error) / abs(reference_velocity)
+                                     if error is not None else None)
+            else:
+                delay_ms = absolute_delay_ms = None
+        else:
+            delay_ms = (1000 * direction * error / average
+                        if error is not None and average is not None else None)
+            absolute_delay_ms = (1000 * abs(error) / average
+                                 if error is not None and average is not None else None)
         row.update(actual_um=actual, error_um=error,
-                   delay_ms=1000 * direction * error / average
-                   if error is not None and average is not None else None,
-                   absolute_delay_ms=1000 * abs(error) / average
-                   if error is not None and average is not None else None,
+                   delay_ms=delay_ms,
+                   absolute_delay_ms=absolute_delay_ms,
                    send_time_s=row["sent_abs_s"] - origin if row.get("sent_abs_s") is not None else None,
                    send_lateness_ms=1000 * (row["sent_abs_s"] - origin - row["scheduled_send_s"])
                    if row.get("sent_abs_s") is not None else None,
@@ -562,6 +721,7 @@ def analyze(result):
                    if row.get("sent_abs_s") is not None else None,
                    ack_time_s=row["ack_abs_s"] - origin if row.get("ack_abs_s") is not None else None)
         rows.append(row)
+        previous_target, previous_deadline = row["target_um"], deadline
     if result.get("profile"):
         profile = MotionProfile(**result["profile"])
         for s in unique:
@@ -685,7 +845,13 @@ def draw_curve_goto_result(analysis, title, figure=None):
     ax2.plot([s["time_s"] for s in samples],
              [s["velocity_um_s"] if s["velocity_um_s"] is not None else math.nan for s in samples],
              label="Reported velocity")
-    ax2.set(xlabel="Time (s)", ylabel="Velocity (um/s)", title="Reported velocity")
+    reference_velocity = [r.get("reference_velocity_um_s") for r in steps]
+    if steps and any(v is not None for v in reference_velocity):
+        ax2.plot([r["deadline_s"] for r in steps],
+                 [v if v is not None else math.nan for v in reference_velocity],
+                 "--", color="tab:orange", label="Reference velocity")
+        ax2.legend()
+    ax2.set(xlabel="Time (s)", ylabel="Velocity (um/s)", title="Reported / reference velocity")
 
     ax3.plot([r["deadline_s"] for r in steps],
              [r["delay_ms"] if r["delay_ms"] is not None else math.nan for r in steps],
@@ -874,6 +1040,22 @@ def gui(args):
     for speed in (200, 400, 600, 800, 1000):
         ttk.Button(presets, text=f"{speed} μm/s", command=lambda s=speed: preset(s)).pack(side="left", padx=3)
 
+    target_speed = tk.StringVar(value="")
+    def refresh_target_speed(*_):
+        try:
+            interval_ms = float(fields["interval_ms"].get())
+            step_um = float(fields["step_um"].get())
+            if not math.isfinite(interval_ms) or not math.isfinite(step_um) or interval_ms <= 0:
+                raise ValueError
+            target_speed.set(f"当前等效目标更新速度：{abs(step_um) * 1000 / interval_ms:g} μm/s")
+        except (ValueError, TypeError):
+            target_speed.set("当前等效目标更新速度：- μm/s")
+
+    fields["interval_ms"].trace_add("write", refresh_target_speed)
+    fields["step_um"].trace_add("write", refresh_target_speed)
+    ttk.Label(presets, textvariable=target_speed, foreground="gray").pack(side="left", padx=14)
+    refresh_target_speed()
+
     continuous_box = ttk.LabelFrame(root, text="连续模式：分别勾选测试；均不勾选 = 原 GOTO", padding=6)
     continuous_box.pack(fill="x", padx=10, pady=3)
     def choose_mode(key):
@@ -993,6 +1175,7 @@ def gui(args):
         controls.pack(fill="x")
         step_ms_var = tk.StringVar(value=str(args.interval_ms))
         steps_var = tk.StringVar(value=str(args.steps))
+        mode_var = tk.StringVar(value="GOTO")
         file_var = tk.StringVar(value="尚未导入 mapping")
         test_status = tk.StringVar(value="请先导入 mapping 曲线")
         z_position = tk.StringVar(value="Z: 未连接")
@@ -1001,6 +1184,10 @@ def gui(args):
         ttk.Entry(controls, textvariable=step_ms_var, width=10).pack(side="left", padx=5)
         ttk.Label(controls, text="步数").pack(side="left", padx=(12, 0))
         ttk.Entry(controls, textvariable=steps_var, width=10).pack(side="left", padx=5)
+        ttk.Label(controls, text="测试模式").pack(side="left", padx=(12, 0))
+        ttk.Combobox(controls, textvariable=mode_var,
+                     values=("GOTO", "A 速度微调", "B 位置提前"),
+                     state="readonly", width=12).pack(side="left", padx=5)
         ttk.Label(controls, textvariable=file_var).pack(side="left", padx=12)
 
         xy_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
@@ -1092,12 +1279,23 @@ def gui(args):
                     raise ValueError("每一步时间必须在 5~10000 ms")
                 if not 1 <= steps <= 10000:
                     raise ValueError("步数必须在 1~10000")
-                cfg = argparse.Namespace(**vars(args))
+                cfg = cfg_from_form()
+                selected_mode = mode_var.get()
+                action = {"GOTO": "run_mapping_goto",
+                          "A 速度微调": "run_curve_continuous",
+                          "B 位置提前": "run_curve_continuous"}.get(selected_mode)
+                if action is None:
+                    raise ValueError("请选择有效的测试模式")
+                control_mode = {"A 速度微调": "VELOCITY_TRIM",
+                                "B 位置提前": "TRACK_POSITION_LEAD"}.get(selected_mode)
                 cancel.clear()
                 start_button.configure(state="disabled")
                 test_status.set("已开始曲线 GOTO 测试")
-                tasks.put(("run_mapping_goto", cfg,
-                           {"curve": curve, "step_ms": step_ms, "steps": steps}))
+                test_status.set(f"已开始曲线 {selected_mode} 测试")
+                value = {"curve": curve, "step_ms": step_ms, "steps": steps}
+                if control_mode is not None:
+                    value["mode"] = control_mode
+                tasks.put((action, cfg, value))
             except Exception as exc:
                 messagebox.showerror("曲线 GOTO 测试", str(exc), parent=top)
 
@@ -1371,6 +1569,14 @@ def gui(args):
                                                         value["step_ms"], value["steps"],
                                                         cancel,
                                                         lambda message: messages.put(("curve_status", message)))
+                        messages.put(("curve_result", result))
+                    elif action == "run_curve_continuous":
+                        if link is None:
+                            raise RuntimeError("请先连接 STM32")
+                        result = run_curve_continuous_test(
+                            link, cfg, value["curve"], value["step_ms"],
+                            value["steps"], value["mode"], cancel,
+                            lambda message: messages.put(("curve_status", message)))
                         messages.put(("curve_result", result))
                     elif action == "move_z_zero":
                         if link is None:
