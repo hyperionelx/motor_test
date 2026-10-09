@@ -547,6 +547,8 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
     if any(not cfg.min_um <= target <= cfg.max_um for target in targets):
         raise ValueError("mapping 曲线目标超出 Z 轴软限位")
     acceleration, deceleration = link.read_motion_limits()
+    acceleration = min(acceleration, cfg.acceleration_um_s2)
+    deceleration = min(deceleration, cfg.acceleration_um_s2)
     path_distance = sum(abs(b - a) for a, b in zip(targets, targets[1:]))
     vmax = link.max_velocity
     peak = min(vmax, math.sqrt(2 * path_distance /
@@ -659,6 +661,7 @@ def analyze(result):
     cfg, origin = result["config"], result["origin_abs_s"]
     if not samples:
         return dict(steps=[], samples=[], average_speed_um_s=None,
+                    mean_error_um=None, error_variance_um2=None,
                     valid_step_count=0, measurement_valid=False)
     # 最小收包偏移估计两个时钟的平移；包含未知最小传输时延，非硬同步。
     offset = min(s["host_abs_s"] - s["mcu_s"] for s in samples)
@@ -736,6 +739,9 @@ def analyze(result):
                 clock_offset_s=offset,
                 rms_error_um=math.sqrt(sum(e * e for e in errors) / len(errors)) if errors else None,
                 max_abs_error_um=max(map(abs, errors)) if errors else None,
+                mean_error_um=(sum(errors) / len(errors)) if errors else None,
+                error_variance_um2=(sum((e - sum(errors) / len(errors)) ** 2 for e in errors) /
+                                    len(errors)) if errors else None,
                 plateau_velocity_ripple_rms_um_s=math.sqrt(sum(
                     (s["velocity_um_s"] - s["reference_velocity_um_s"]) ** 2 for s in plateau) /
                     len(plateau)) if plateau else None,
@@ -1190,6 +1196,23 @@ def gui(args):
                      state="readonly", width=12).pack(side="left", padx=5)
         ttk.Label(controls, textvariable=file_var).pack(side="left", padx=12)
 
+        curve_control_vars = {}
+        curve_control_specs = (
+            ("control_ms", "连续周期 ms"),
+            ("acceleration_um_s2", "参考加速度 μm/s²"),
+            ("kp_s", "A增益 /s"),
+            ("trim_percent", "A微调上限 %"),
+            ("lead_ms", "B提前量 ms"),
+            ("deadband_um", "A死区 μm"),
+            ("max_following_um", "误差停止阈值 μm"),
+        )
+        ab_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
+        ab_controls.pack(fill="x")
+        for key, label in curve_control_specs:
+            curve_control_vars[key] = tk.StringVar(value=str(getattr(args, key)))
+            ttk.Label(ab_controls, text=label).pack(side="left", padx=(4, 2))
+            ttk.Entry(ab_controls, textvariable=curve_control_vars[key], width=9).pack(side="left", padx=(0, 6))
+
         xy_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
         xy_controls.pack(fill="x")
         xy_start_x_var = tk.StringVar(value=str(args.xy_start_x))
@@ -1281,6 +1304,8 @@ def gui(args):
                     raise ValueError("步数必须在 1~10000")
                 cfg = cfg_from_form()
                 selected_mode = mode_var.get()
+                for key, variable in curve_control_vars.items():
+                    setattr(cfg, key, float(variable.get()))
                 action = {"GOTO": "run_mapping_goto",
                           "A 速度微调": "run_curve_continuous",
                           "B 位置提前": "run_curve_continuous"}.get(selected_mode)
@@ -1288,6 +1313,10 @@ def gui(args):
                     raise ValueError("请选择有效的测试模式")
                 control_mode = {"A 速度微调": "VELOCITY_TRIM",
                                 "B 位置提前": "TRACK_POSITION_LEAD"}.get(selected_mode)
+                if control_mode is not None:
+                    cfg.velocity_mode = control_mode == "VELOCITY_TRIM"
+                    cfg.position_mode = control_mode == "TRACK_POSITION_LEAD"
+                    validate_control(cfg)
                 cancel.clear()
                 start_button.configure(state="disabled")
                 test_status.set("已开始曲线 GOTO 测试")
@@ -1747,6 +1776,9 @@ def gui(args):
                         ideal_page_state["canvas"].draw_idle()
                     if ideal_page_state["status"] is not None:
                         error_text = result.get("error") or result.get("stop_error") or ""
+                        error_text = (f"平均坐标误差 {analysis.get('mean_error_um')} μm；"
+                                      f"误差方差 {analysis.get('error_variance_um2')} μm²；"
+                                      f"{error_text}")
                         ideal_page_state["status"].set(
                             f"测试{result['status']}；有效点 {analysis['valid_step_count']}；"
                             f"最大误差 {analysis.get('max_abs_error_um')}"
@@ -1767,6 +1799,11 @@ def gui(args):
                     draw(analysis, result_title(value), figure)
                     canvas.draw_idle()
                     avg = analysis["average_speed_um_s"]
+                    mean_error = analysis.get("mean_error_um")
+                    error_variance = analysis.get("error_variance_um2")
+                    value["error"] = (f"平均坐标误差 {mean_error} μm；"
+                                       f"误差方差 {error_variance} μm²；"
+                                       f"{value.get('error', '')}")
                     status.set(f"{value['status']}；实测平均速度 {avg if avg is not None else '无有效数据'} μm/s；"
                                f"有效点 {analysis['valid_step_count']}/{analysis.get('evaluation_count', value['config']['steps'])}；"
                                f"{value.get('error', '')} 保存：{output}")

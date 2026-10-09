@@ -281,6 +281,9 @@ def analyze_mapping(result, samples, interpolate, z_gap):
                                   and all(r["actual_um"] is not None for r in rows if 0 <= r["deadline_s"] <= duration),
                 rms_error_um=math.sqrt(sum(e * e for e in errors) / len(errors)) if errors else None,
                 max_abs_error_um=max(map(abs, errors)) if errors else None,
+                mean_error_um=(sum(errors) / len(errors)) if errors else None,
+                error_variance_um2=(sum((e - sum(errors) / len(errors)) ** 2 for e in errors) /
+                                    len(errors)) if errors else None,
                 reference_velocity_error_rms_um_s=math.sqrt(sum(v * v for v in ripple) / len(ripple)) if ripple else None,
                 lag_definition="1000*(mapping target - reported Z)/local signed ideal Z velocity; undefined below 0.5 um/s",
                 xy_position_source=result["config"]["xy_source"])
