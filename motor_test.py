@@ -650,7 +650,11 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
     previous_command_at = 0.
     peak_following_error = 0.
     following_recovery_count = 0
+    endpoint_braking_count = 0
+    endpoint_direction = (1. if targets[-1] > targets[0] else
+                          -1. if targets[-1] < targets[0] else 0.)
     settle_deadline = None
+    terminal_hold_started = None
     z_stable = 0
     previous_z = None
     try:
@@ -697,6 +701,19 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                     correction = min(correction_request, bound)
                     correction = math.copysign(correction, cfg.kp_s * effective)
                     desired_velocity = max(-vmax, min(vmax, ideal_velocity + correction))
+                    # The motor cannot stop instantaneously at total_time.
+                    # Start braking before the endpoint according to the
+                    # physical stopping distance v^2 <= 2*a*d.  This is
+                    # essential for A, otherwise a zero command at the
+                    # endpoint still leaves enough momentum to overshoot.
+                    if endpoint_direction and desired_velocity * endpoint_direction > 0:
+                        remaining_to_end = endpoint_direction * (targets[-1] - position)
+                        control_delay_distance = abs(previous_command_velocity) * period
+                        braking_distance = max(0., remaining_to_end - control_delay_distance)
+                        endpoint_speed = math.sqrt(2. * deceleration * braking_distance)
+                        if abs(desired_velocity) > endpoint_speed:
+                            desired_velocity = endpoint_direction * endpoint_speed
+                            endpoint_braking_count += 1
                     dt_command = max(0., now - previous_command_at)
                     if previous_command_at == 0:
                         command_velocity = desired_velocity
@@ -710,6 +727,11 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                     if (previous_command_velocity and command_velocity and
                             previous_command_velocity * command_velocity < 0):
                         command_velocity = 0.
+                    # The firmware can still move during STOP deceleration.
+                    # Do not finish a terminal hold with a tiny non-zero
+                    # velocity, otherwise the measured endpoint overshoots.
+                    if abs(command_velocity) < 1.28:
+                        command_velocity = 0.
                     previous_command_velocity = command_velocity
                     previous_command_at = now
                     rec.update(command_velocity_um_s=command_velocity,
@@ -717,11 +739,40 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                                following_recovery=abs(error) > cfg.max_following_um)
                     link.velocity(command_velocity, rec)
                 else:
-                    lead_target, lead_velocity = reference(control_time, cfg.lead_ms / 1000)
+                    lead_s = cfg.lead_ms / 1000
+                    # The lead distance is useful in the middle of the
+                    # trajectory, but keeping it at the endpoint makes TRACK
+                    # command a future position while the motor still has
+                    # stopping distance left.  Taper the lead to zero before
+                    # the endpoint instead of removing it abruptly.
+                    if endpoint_direction:
+                        remaining_to_end = endpoint_direction * (targets[-1] - position)
+                        current_velocity = abs(reference(control_time)[1])
+                        stop_distance = (current_velocity * current_velocity /
+                                         (2. * deceleration) +
+                                         current_velocity * period)
+                        lead_distance = current_velocity * lead_s
+                        if lead_distance > 1e-9:
+                            lead_factor = max(0., min(1.,
+                                (remaining_to_end - stop_distance) / lead_distance))
+                            lead_s *= lead_factor
+                    lead_target, lead_velocity = reference(control_time, lead_s)
+                    # TRACK also carries a velocity feed-forward.  Near the
+                    # endpoint, cap that velocity by the physical stopping
+                    # distance so the lead target cannot cause a large pass.
+                    if endpoint_direction and lead_velocity * endpoint_direction > 0:
+                        remaining_to_end = endpoint_direction * (targets[-1] - position)
+                        braking_distance = max(
+                            0., remaining_to_end - abs(lead_velocity) * period)
+                        endpoint_speed = math.sqrt(2. * deceleration * braking_distance)
+                        if abs(lead_velocity) > endpoint_speed:
+                            lead_velocity = endpoint_direction * endpoint_speed
+                            endpoint_braking_count += 1
                     sequence = (sequence + 1) & 0xFFFF
                     rec.update(command_position_um=lead_target,
                                command_velocity_um_s=lead_velocity,
-                               position_lead_um=lead_target - target)
+                               position_lead_um=lead_target - target,
+                               effective_lead_ms=1000. * lead_s)
                     link.track(lead_target, lead_velocity, sequence,
                                start=(sequence == 1), record=rec)
                 if control_time >= total_time:
@@ -738,6 +789,8 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                 display_at = now
             if elapsed >= total_time:
                 position = link.latest["position_um"]
+                if mode == "TRACK_POSITION_LEAD" and terminal_hold_started is None:
+                    terminal_hold_started = now
                 if settle_deadline is None:
                     remaining = abs(targets[-1] - position)
                     settle_deadline = now + max(
@@ -752,7 +805,11 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                 previous_z = position
                 final_error = targets[-1] - position
                 if (abs(final_error) <= max(.5, cfg.deadband_um) and
-                        z_stable >= 3 and
+                        (mode != "VELOCITY_TRIM" or
+                         abs(previous_command_velocity) < 1e-9) and
+                        z_stable >= (8 if mode == "TRACK_POSITION_LEAD" else 3) and
+                        (mode != "TRACK_POSITION_LEAD" or
+                         now - terminal_hold_started >= max(.25, cfg.tail_ms / 1000)) and
                         elapsed - total_time >= cfg.tail_ms / 1000):
                     result["status"] = "complete"
                     break
@@ -764,6 +821,17 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
         result["status"], result["error"] = "failed", str(exc)
     finally:
         try:
+            if result["status"] == "complete" and mode == "TRACK_POSITION_LEAD":
+                # Keep the final TRACK anchor active immediately before STOP.
+                # STOP alone can release the position loop while the motor is
+                # still settling, making the final reported position differ
+                # from the requested curve endpoint.
+                hold_deadline = time.perf_counter() + max(.15, cfg.control_ms / 1000 * 3)
+                while time.perf_counter() < hold_deadline:
+                    sequence = (sequence + 1) & 0xFFFF
+                    link.track(targets[-1], 0., sequence, record=None)
+                    link.poll()
+                    time.sleep(min(.002, period))
             stop_and_wait(link)
         except Exception as exc:
             result["stop_error"] = str(exc)
@@ -774,9 +842,14 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
         result["events"] = [e for e in link.events if e["host_abs_s"] >= t0]
         result["bad_frames"] = link.decoder.bad_frames - initial_bad
         result["lost_samples"] = link.lost_samples - initial_lost
-        result["final_error_um"] = targets[-1] - link.latest["position_um"]
+        # stop_and_wait() may consume the last deceleration samples.  Report
+        # the real settled endpoint, not the position from the pre-STOP test
+        # loop (which made endpoint overshoot look smaller than it was).
+        result["final_position_um"] = link.latest["position_um"]
+        result["final_error_um"] = targets[-1] - result["final_position_um"]
         result["peak_following_error_um"] = peak_following_error
         result["following_recovery_commands"] = following_recovery_count
+        result["endpoint_braking_commands"] = endpoint_braking_count
     return result
 
 
@@ -1002,8 +1075,12 @@ def draw_curve_goto_result(analysis, title, figure=None):
     ax4.plot([r["deadline_s"] for r in steps],
              [r["target_um"] - start_um for r in steps],
              color="tab:orange", linestyle="-", linewidth=1.8, label="Ideal curve")
-    ax4.plot([s["time_s"] for s in samples],
-             [s["position_um"] - start_um for s in samples],
+    # Keep the pre-test samples for interpolation, but do not draw them as
+    # part of the motion curve: they make the A start look like an initial
+    # tracking error before the first command was sent.
+    plotted_samples = [s for s in samples if s["time_s"] >= 0.]
+    ax4.plot([s["time_s"] for s in plotted_samples],
+             [s["position_um"] - start_um for s in plotted_samples],
              color="tab:blue", linestyle=":", marker="o", markersize=2,
              label="Actual reported")
     ax4.set(xlabel="Time (s)", ylabel="Relative position / distance (um)",
