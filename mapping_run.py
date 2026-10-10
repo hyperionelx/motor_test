@@ -126,6 +126,10 @@ def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None
     period = (cfg.interval_ms if mode == "GOTO" else cfg.control_ms) / 1000
     next_send = 0.
     last_xy_seq, end_at, stable = None, None, 0
+    z_stable = 0
+    previous_z = None
+    settle_deadline = None
+    final_target = curve.target_z_um[-1] + cfg.z_offset_um
     try:
         if cancel.is_set():
             result["status"] = "cancelled"
@@ -179,11 +183,10 @@ def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None
                 raise RuntimeError("Z 跟随误差超过停止阈值")
             t = now - t0
             if t >= next_send:
-                if t - next_send >= period:
-                    raise RuntimeError("控制线程迟到一个周期，已停止，未补发")
+                scheduled_send = next_send
                 current = line.reference(sample["x_mm"], sample["y_mm"], vx, vy,
                                          lead_s=now - sample["host_abs_s"])
-                row = dict(kind=mode, scheduled_send_s=next_send, control_time_s=t,
+                row = dict(kind=mode, scheduled_send_s=scheduled_send, control_time_s=t,
                            xy_time_s=sample["host_abs_s"] - t0, x_mm=sample["x_mm"], y_mm=sample["y_mm"],
                            reference_um=current["target_um"], reference_velocity_um_s=current["ideal_velocity_um_s"],
                            following_error_um=error, feedback_um=position)
@@ -203,14 +206,39 @@ def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None
                                position_lead_um=lead["target_um"] - current["target_um"])
                     sequence = (sequence + 1) & 0xFFFF
                     link.track(row["command_position_um"], row["command_velocity_um_s"], sequence, record=row)
-                next_send += period
+                if t - scheduled_send >= period:
+                    next_send = t + period
+                else:
+                    next_send = scheduled_send + period
             if now - display_at >= .1:
                 update(f"XY ({sample['x_mm']:.3f}, {sample['y_mm']:.3f}) mm；mapping Z {raw['target_um']:.3f} μm；"
                        f"Z {position:.3f} μm；vZ {raw['ideal_velocity_um_s']:.1f} μm/s；{mode}")
                 display_at = now
-            if end_at is not None and now - end_at >= cfg.tail_ms / 1000:
-                result["status"] = "complete"
-                break
+            if end_at is not None:
+                # XY reaching its endpoint only means that the reference has
+                # stopped changing.  Z still needs time to settle at the
+                # final mapping value before the test may issue STOP.
+                if settle_deadline is None:
+                    remaining = abs(final_target - position)
+                    settle_deadline = now + max(
+                        cfg.tail_ms / 1000,
+                        1.0,
+                        2.0 * remaining / max(1.28, vmax) + 1.0)
+                if (previous_z is not None and
+                        abs(position - previous_z) <= 0.05):
+                    z_stable += 1
+                else:
+                    z_stable = 0
+                previous_z = position
+                final_error = final_target - position
+                if (abs(final_error) <= max(.5, cfg.deadband_um) and
+                        z_stable >= 3 and
+                        now - end_at >= cfg.tail_ms / 1000):
+                    result["status"] = "complete"
+                    break
+                if now >= settle_deadline:
+                    raise TimeoutError(
+                        f"Z 未到达 mapping 终点，剩余误差 {final_error:.3f} μm")
             cancel.wait(.001)
         if result["status"] == "complete" and any(r.get("ack_required") and r.get("ack_abs_s") is None for r in commands):
             raise TimeoutError("末尾仍有待确认的 GOTO/START")
@@ -222,6 +250,9 @@ def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None
             key = link.stop()
             if key is not None:
                 link.until(lambda: key not in link.pending, .6)
+            waiter = getattr(link, "wait_idle", None)
+            if waiter is not None:
+                waiter()
         except Exception as exc:
             result["status"], result["stop_error"] = "failed", str(exc)
         try:

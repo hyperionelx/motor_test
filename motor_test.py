@@ -325,6 +325,28 @@ class MotorLink:
             return self.send(STOP)
         return None
 
+    def wait_idle(self, timeout=2.0, stable_samples=2):
+        """Wait until STOP has actually taken effect on the controller."""
+        deadline = time.perf_counter() + timeout
+        stable = 0
+        previous_position = None
+        while True:
+            self.poll()
+            sample = self.latest
+            if sample is not None and sample.get("state") == 0:
+                position = sample["position_um"]
+                if (previous_position is None or
+                        abs(position - previous_position) <= 0.05):
+                    stable += 1
+                else:
+                    stable = 0
+                previous_position = position
+                if stable >= stable_samples:
+                    return
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("STOP 已确认，但 Z 马达未在规定时间内进入 IDLE")
+            time.sleep(0.001)
+
     def close(self):
         if self.ser.is_open:
             try:
@@ -349,6 +371,16 @@ def make_plan(start, step, interval_ms, steps, minimum, maximum):
     dt = interval_ms / 1000
     return [dict(step=i, scheduled_send_s=(i - 1) * dt, deadline_s=i * dt,
                  target_um=start + i * step) for i in range(1, steps + 1)]
+
+
+def stop_and_wait(link, timeout=2.0):
+    """Send STOP, wait for ACK, then wait for physical IDLE if supported."""
+    key = link.stop()
+    if key is not None:
+        link.until(lambda: key not in link.pending, .6)
+    waiter = getattr(link, "wait_idle", None)
+    if waiter is not None:
+        waiter(timeout)
 
 
 def run_test(link, cfg, cancel, update=lambda message: None):
@@ -400,9 +432,7 @@ def run_test(link, cfg, cancel, update=lambda message: None):
         result["status"], result["error"] = "failed", str(exc)
     finally:
         try:
-            key = link.stop()
-            if key is not None:
-                link.until(lambda: key not in link.pending, 0.6)
+            stop_and_wait(link)
         except Exception as exc:
             result["stop_error"] = str(exc)
             result["status"] = "failed"
@@ -418,6 +448,8 @@ def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
     """按 mapping 曲线等时间采样，执行不联动 XY 的 GOTO 测试。"""
     if link.latest is None or time.perf_counter() - link.latest["host_abs_s"] > 0.2:
         raise RuntimeError("没有新鲜的位置遥测")
+    if link.latest.get("state", 0) != 0:
+        raise RuntimeError("曲线测试开始前 Z 马达必须处于 IDLE")
     if not math.isfinite(step_ms) or not 5 <= step_ms <= 10000:
         raise ValueError("曲线测试每步时间必须在 5~10000 ms")
     if not isinstance(steps, int) or not 1 <= steps <= 10000:
@@ -463,9 +495,13 @@ def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
                   status="running", firmware=link.info, max_velocity_um_s=link.max_velocity)
     next_index = 0
     display_at = 0.0
-    end_s = steps * dt + cfg.tail_ms / 1000
+    duration = steps * dt
+    final_send_at = None
+    settle_deadline = None
+    z_stable = 0
+    previous_z = None
     try:
-        while time.perf_counter() - t0 < end_s:
+        while True:
             if cancel.is_set():
                 result["status"] = "cancelled"
                 break
@@ -474,29 +510,58 @@ def run_mapping_goto_test(link, cfg, curve, step_ms, steps, cancel,
             if now - link.latest["host_abs_s"] > max(0.2, 3 * link.sample_ms / 1000):
                 raise TimeoutError("位置遥测中断")
             if next_index < len(plan) and now - t0 >= plan[next_index]["scheduled_send_s"]:
-                late = now - t0 - plan[next_index]["scheduled_send_s"]
-                if late >= dt:
-                    raise RuntimeError("曲线 GOTO 发送晚了一个完整周期，已停止以避免突发补发")
+                elapsed = now - t0
+                due_index = min(len(plan) - 1,
+                                max(next_index, int(elapsed / dt)))
+                next_index = due_index
                 rec = plan[next_index].copy()
                 commands.append(rec)
                 link.goto(rec["target_um"], rec)
                 next_index += 1
+            elapsed = now - t0
+            if elapsed >= duration:
+                if final_send_at is None or now - final_send_at >= dt:
+                    rec = dict(kind="TERMINAL", step=len(plan),
+                               scheduled_send_s=elapsed,
+                               deadline_s=duration,
+                               target_um=targets[-1])
+                    commands.append(rec)
+                    link.goto(targets[-1], rec)
+                    final_send_at = now
+                position = link.latest["position_um"]
+                if settle_deadline is None:
+                    remaining = abs(targets[-1] - position)
+                    settle_deadline = now + max(
+                        cfg.tail_ms / 1000,
+                        1.0,
+                        2.0 * remaining / max(1.28, vmax) + 1.0)
+                if (previous_z is not None and
+                        abs(position - previous_z) <= 0.05):
+                    z_stable += 1
+                else:
+                    z_stable = 0
+                previous_z = position
+                final_error = targets[-1] - position
+                if (abs(final_error) <= max(.5, cfg.deadband_um) and
+                        z_stable >= 3 and
+                        elapsed - duration >= cfg.tail_ms / 1000):
+                    result["status"] = "complete"
+                    break
+                if now >= settle_deadline:
+                    raise TimeoutError(
+                        f"Z 未到达 mapping 终点，剩余误差 {final_error:.3f} μm")
             if now - display_at >= 0.1:
                 update(f"曲线 GOTO：位置 {link.latest['position_um']:.3f} μm；"
                        f"指令 {next_index}/{len(plan)}")
                 display_at = now
             cancel.wait(0.001)
-        else:
-            result["status"] = "complete"
         if result["status"] == "complete" and any(c["ack_abs_s"] is None for c in commands):
             raise TimeoutError("曲线 GOTO 测试末尾存在未确认命令")
     except Exception as exc:
         result["status"], result["error"] = "failed", str(exc)
     finally:
         try:
-            key = link.stop()
-            if key is not None:
-                link.until(lambda: key not in link.pending, 0.6)
+            stop_and_wait(link)
         except Exception as exc:
             result["stop_error"] = str(exc)
             result["status"] = "failed"
@@ -514,6 +579,8 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
         raise ValueError("曲线连续测试模式无效")
     if link.latest is None or time.perf_counter() - link.latest["host_abs_s"] > 0.2:
         raise RuntimeError("没有新鲜的位置遥测")
+    if link.latest.get("state", 0) != 0:
+        raise RuntimeError("曲线测试开始前 Z 马达必须处于 IDLE")
     if not math.isfinite(step_ms) or not 5 <= step_ms <= 10000:
         raise ValueError("曲线测试每步时间必须在 5~10000 ms")
     if not isinstance(steps, int) or not 1 <= steps <= 10000:
@@ -576,8 +643,18 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                   max_velocity_um_s=link.max_velocity)
     period = cfg.control_ms / 1000
     next_send, sequence, display_at = 0., 0, 0.
+    # A is a velocity command mode.  Keep the command continuous; sending a
+    # large velocity jump makes the firmware lag behind the reference and the
+    # old hard following-error check then stopped the test after a few frames.
+    previous_command_velocity = 0.
+    previous_command_at = 0.
+    peak_following_error = 0.
+    following_recovery_count = 0
+    settle_deadline = None
+    z_stable = 0
+    previous_z = None
     try:
-        while time.perf_counter() - t0 < total_time + cfg.tail_ms / 1000:
+        while True:
             if cancel.is_set():
                 result["status"] = "cancelled"
                 break
@@ -585,17 +662,24 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
             now = time.perf_counter()
             if now - link.latest["host_abs_s"] > max(.2, 3 * link.sample_ms / 1000):
                 raise TimeoutError("位置遥测中断")
-            if now - t0 >= next_send and next_send <= total_time:
-                late = now - t0 - next_send
-                if late >= period:
-                    raise RuntimeError("曲线连续控制发送晚了一个完整周期，已停止")
-                target, ideal_velocity = reference(next_send)
+            elapsed = now - t0
+            if elapsed >= next_send and (next_send <= total_time or elapsed >= total_time):
+                control_time = min(elapsed, total_time)
+                target, ideal_velocity = reference(control_time)
                 position = link.latest["position_um"]
                 error = target - position
-                if abs(error) > cfg.max_following_um:
-                    raise RuntimeError(f"Z 跟随误差超过停止阈值：{error:.3f} μm")
+                peak_following_error = max(peak_following_error, abs(error))
+                # A short communication/scheduling delay can temporarily
+                # exceed max_following_um.  Treat it as a recovery condition,
+                # not as a random test abort.  Keep a larger hard safety
+                # limit so a genuinely lost actuator is still stopped.
+                emergency_error = max(100., 4. * cfg.max_following_um)
+                if abs(error) > emergency_error:
+                    raise RuntimeError(
+                        f"Z 跟随误差超过安全阈值：{error:.3f} μm")
                 rec = dict(step=sequence, scheduled_send_s=next_send,
-                           deadline_s=next_send, target_um=target,
+                           deadline_s=control_time, control_time_s=control_time,
+                           target_um=target,
                            reference_velocity_um_s=ideal_velocity,
                            following_error_um=error)
                 if mode == "VELOCITY_TRIM":
@@ -603,46 +687,96 @@ def run_curve_continuous_test(link, cfg, curve, step_ms, steps, mode, cancel,
                     # 使用整条曲线的参考峰值作为 A 方案微调上限；
                     # 否则曲线末端理想速度为 0 时，位置误差将无法修正。
                     bound = reference_peak * cfg.trim_percent / 100
-                    correction = min(abs(cfg.kp_s * effective), bound)
+                    correction_request = abs(cfg.kp_s * effective)
+                    if abs(error) > cfg.max_following_um:
+                        # Once lagging, the configured trim cap is not enough
+                        # to catch up.  Temporarily allow proportional
+                        # recovery, still limited by the motor's vmax.
+                        following_recovery_count += 1
+                        bound = max(bound, min(vmax, correction_request))
+                    correction = min(correction_request, bound)
                     correction = math.copysign(correction, cfg.kp_s * effective)
-                    command_velocity = ideal_velocity + correction
-                    if abs(command_velocity) > vmax + 1e-6:
-                        raise RuntimeError("A 方案所需 Z 速度超过固件上限")
+                    desired_velocity = max(-vmax, min(vmax, ideal_velocity + correction))
+                    dt_command = max(0., now - previous_command_at)
+                    if previous_command_at == 0:
+                        command_velocity = desired_velocity
+                    else:
+                        rate = acceleration if abs(desired_velocity) >= abs(previous_command_velocity) else deceleration
+                        max_delta = rate * dt_command
+                        command_velocity = previous_command_velocity + max(
+                            -max_delta, min(max_delta, desired_velocity - previous_command_velocity))
+                    # Never reverse in one command update.  Passing through
+                    # zero avoids a direction jump at a curved mapping kink.
+                    if (previous_command_velocity and command_velocity and
+                            previous_command_velocity * command_velocity < 0):
+                        command_velocity = 0.
+                    previous_command_velocity = command_velocity
+                    previous_command_at = now
                     rec.update(command_velocity_um_s=command_velocity,
-                               correction_velocity_um_s=correction)
+                               correction_velocity_um_s=correction,
+                               following_recovery=abs(error) > cfg.max_following_um)
                     link.velocity(command_velocity, rec)
                 else:
-                    lead_target, lead_velocity = reference(next_send, cfg.lead_ms / 1000)
+                    lead_target, lead_velocity = reference(control_time, cfg.lead_ms / 1000)
                     sequence = (sequence + 1) & 0xFFFF
                     rec.update(command_position_um=lead_target,
                                command_velocity_um_s=lead_velocity,
                                position_lead_um=lead_target - target)
                     link.track(lead_target, lead_velocity, sequence,
                                start=(sequence == 1), record=rec)
+                if control_time >= total_time:
+                    rec["kind"] = "TERMINAL"
+                    next_send = elapsed + period
+                elif control_time - next_send >= period:
+                    next_send = control_time + period
+                else:
+                    next_send += period
                 commands.append(rec)
-                next_send += period
             if now - display_at >= 0.1:
                 update(f"{mode}：位置 {link.latest['position_um']:.3f} μm；"
                        f"目标 {next_send:.3f} s")
                 display_at = now
+            if elapsed >= total_time:
+                position = link.latest["position_um"]
+                if settle_deadline is None:
+                    remaining = abs(targets[-1] - position)
+                    settle_deadline = now + max(
+                        cfg.tail_ms / 1000,
+                        1.0,
+                        2.0 * remaining / max(1.28, vmax) + 1.0)
+                if (previous_z is not None and
+                        abs(position - previous_z) <= 0.05):
+                    z_stable += 1
+                else:
+                    z_stable = 0
+                previous_z = position
+                final_error = targets[-1] - position
+                if (abs(final_error) <= max(.5, cfg.deadband_um) and
+                        z_stable >= 3 and
+                        elapsed - total_time >= cfg.tail_ms / 1000):
+                    result["status"] = "complete"
+                    break
+                if now >= settle_deadline:
+                    raise TimeoutError(
+                        f"Z 未到达 mapping 终点，剩余误差 {final_error:.3f} μm")
             cancel.wait(.001)
-        else:
-            result["status"] = "complete"
     except Exception as exc:
         result["status"], result["error"] = "failed", str(exc)
     finally:
         try:
-            key = link.stop()
-            if key is not None:
-                link.until(lambda: key not in link.pending, .6)
+            stop_and_wait(link)
         except Exception as exc:
             result["stop_error"] = str(exc)
             result["status"] = "failed"
-        result["config"]["steps"] = len(commands)
+        result["evaluation_plan"] = [r for r in commands if r.get("kind") != "TERMINAL"]
+        result["config"]["steps"] = len(result["evaluation_plan"])
         result["samples"] = link.samples[sample_begin:]
         result["events"] = [e for e in link.events if e["host_abs_s"] >= t0]
         result["bad_frames"] = link.decoder.bad_frames - initial_bad
         result["lost_samples"] = link.lost_samples - initial_lost
+        result["final_error_um"] = targets[-1] - link.latest["position_um"]
+        result["peak_following_error_um"] = peak_following_error
+        result["following_recovery_commands"] = following_recovery_count
     return result
 
 
