@@ -383,6 +383,21 @@ def stop_and_wait(link, timeout=2.0):
         waiter(timeout)
 
 
+def curve_subrange(curve, start_distance, end_distance, start_z):
+    """Build a relative mapping slice for a synchronized XY/Z run."""
+    if not (math.isfinite(start_distance) and math.isfinite(end_distance)
+            and curve.distance_mm[0] <= start_distance < end_distance <= curve.distance_mm[-1]):
+        raise ValueError("mapping 曲线距离区间无效")
+    distances = [start_distance]
+    distances.extend(d for d in curve.distance_mm
+                    if start_distance < d < end_distance)
+    distances.append(end_distance)
+    base_z = curve.at(start_distance)[0]
+    targets = [start_z + curve.at(distance)[0] - base_z for distance in distances]
+    return MappingCurve(tuple(distances), tuple(targets), curve.source_path,
+                        curve.source_sha256)
+
+
 def run_test(link, cfg, cancel, update=lambda message: None):
     if mode_name(cfg) != "GOTO":
         return run_continuous(link, cfg, cancel, update)
@@ -1186,7 +1201,9 @@ def gui(args):
     motor_done = threading.Event()
     ideal_page_state = {"page": None, "figure": None, "canvas": None,
                         "status": None, "z_position": None, "z_limit": None,
-                        "start": None}
+                        "start": None, "stage_status": None,
+                        "stage_connect": None, "stage_disconnect": None,
+                        "stage_move": None, "stage_sync": None}
     status = tk.StringVar(value="未连接；请先填写实际机械软限位")
     frame = ttk.Frame(root, padding=10)
     frame.pack(fill="x")
@@ -1392,6 +1409,8 @@ def gui(args):
         controls.pack(fill="x")
         step_ms_var = tk.StringVar(value=str(args.interval_ms))
         steps_var = tk.StringVar(value=str(args.steps))
+        curve_distance_start_var = tk.StringVar(value="")
+        curve_distance_end_var = tk.StringVar(value="")
         mode_var = tk.StringVar(value="GOTO")
         file_var = tk.StringVar(value="尚未导入 mapping")
         test_status = tk.StringVar(value="请先导入 mapping 曲线")
@@ -1406,6 +1425,18 @@ def gui(args):
                      values=("GOTO", "A 速度微调", "B 位置提前"),
                      state="readonly", width=12).pack(side="left", padx=5)
         ttk.Label(controls, textvariable=file_var).pack(side="left", padx=12)
+
+        curve_range_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
+        curve_range_controls.pack(fill="x")
+        ttk.Label(curve_range_controls, text="曲线距离起点 mm").pack(side="left")
+        ttk.Entry(curve_range_controls, textvariable=curve_distance_start_var,
+                  width=10).pack(side="left", padx=4)
+        ttk.Label(curve_range_controls, text="曲线距离终点 mm").pack(side="left", padx=(10, 2))
+        ttk.Entry(curve_range_controls, textvariable=curve_distance_end_var,
+                  width=10).pack(side="left", padx=4)
+        ttk.Label(curve_range_controls,
+                  text="用于选择导入曲线第一列 distance_mm 的区间",
+                  foreground="gray").pack(side="left", padx=10)
 
         curve_control_vars = {}
         curve_control_specs = (
@@ -1425,7 +1456,7 @@ def gui(args):
             ttk.Entry(ab_controls, textvariable=curve_control_vars[key], width=9).pack(side="left", padx=(0, 6))
 
         xy_controls = ttk.Frame(top, padding=(8, 0, 8, 4))
-        xy_controls.pack(fill="x")
+        # Packed below the figure together with the stage controls.
         xy_start_x_var = tk.StringVar(value=str(args.xy_start_x))
         xy_start_y_var = tk.StringVar(value=str(args.xy_start_y))
         xy_end_x_var = tk.StringVar(value=str(args.xy_end_x))
@@ -1494,6 +1525,8 @@ def gui(args):
             try:
                 curve_state["curve"] = MappingCurve.load(path)
                 curve_state["path"] = str(Path(path).resolve())
+                curve_distance_start_var.set(f"{curve_state['curve'].distance_mm[0]:g}")
+                curve_distance_end_var.set(f"{curve_state['curve'].distance_mm[-1]:g}")
                 file_var.set(f"{Path(path).name}；{len(curve_state['curve'].distance_mm)}点；"
                              f"距离 {curve_state['curve'].span_mm:g} mm")
                 redraw()
@@ -1557,6 +1590,216 @@ def gui(args):
                 messagebox.showerror("Z 马达回零", str(exc), parent=top)
 
         ttk.Button(controls, text="Z 马达回到 0", command=move_z_zero).pack(side="left", padx=5)
+        # Independent XY-stage connection for the ideal-curve page. The DLL
+        # is resolved automatically from the bundled zmotion directory.
+        ideal_stage_box = ttk.Frame(top, padding=(8, 0, 8, 4))
+        ideal_stage_box.pack(fill="x")
+        ttk.Label(ideal_stage_box, text="位移台 IP").pack(side="left")
+        ideal_stage_ip = tk.StringVar(value=args.stage_ip)
+        ttk.Entry(ideal_stage_box, textvariable=ideal_stage_ip, width=16).pack(side="left", padx=4)
+        ttk.Label(ideal_stage_box, text="位置源").pack(side="left", padx=(8, 2))
+        ideal_stage_source = tk.StringVar(value=args.xy_source)
+        ttk.Combobox(ideal_stage_box, textvariable=ideal_stage_source,
+                     values=("MPOS", "DPOS"), state="readonly", width=8).pack(side="left")
+        ideal_stage_status = tk.StringVar(
+            value=f"XY: 未连接；自动使用 {Path(default_dll_path()).name}")
+
+        def ideal_stage_action(action):
+            try:
+                ip = ideal_stage_ip.get().strip()
+                if not ip:
+                    raise ValueError("请输入位移台 IP")
+                cfg = argparse.Namespace(**vars(args))
+                cfg.stage_ip = ip
+                cfg.stage_dll = default_dll_path()
+                cfg.xy_source = ideal_stage_source.get()
+                stage_tasks.put((action, cfg))
+                ideal_stage_status.set("XY: 正在连接..." if action == "connect"
+                                       else "XY: 正在断开...")
+                if action == "connect":
+                    ideal_stage_connect.configure(state="disabled")
+                else:
+                    ideal_stage_disconnect.configure(state="disabled")
+            except Exception as exc:
+                messagebox.showerror("位移台", str(exc), parent=top)
+
+        ideal_stage_connect = ttk.Button(
+            ideal_stage_box, text="连接位移台",
+            command=lambda: ideal_stage_action("connect"))
+        ideal_stage_connect.pack(side="left", padx=(10, 3))
+        ideal_stage_disconnect = ttk.Button(
+            ideal_stage_box, text="断开位移台",
+            command=lambda: ideal_stage_action("disconnect"))
+        ideal_stage_disconnect.pack(side="left", padx=3)
+        ttk.Label(ideal_stage_box, textvariable=ideal_stage_status,
+                  foreground="gray").pack(side="left", padx=10)
+        ideal_page_state.update(stage_status=ideal_stage_status,
+                                stage_connect=ideal_stage_connect,
+                                stage_disconnect=ideal_stage_disconnect)
+
+        # Keep XY start/end coordinates next to the stage connection instead
+        # of placing them above the ideal-curve plot.
+        def use_current_xy_as_start():
+            try:
+                with stage_lock:
+                    active_reader = stage_state["reader"]
+                if active_reader is None:
+                    raise RuntimeError("请先连接位移台")
+                sample = active_reader.latest()
+                xy_start_x_var.set(f"{sample['x_mm']:g}")
+                xy_start_y_var.set(f"{sample['y_mm']:g}")
+                ideal_stage_status.set(
+                    f"XY 起点已读取：({sample['x_mm']:.4f}, {sample['y_mm']:.4f}) mm")
+            except Exception as exc:
+                messagebox.showerror("读取 XY 起点", str(exc), parent=top)
+
+        ttk.Button(xy_controls, text="读取当前 XY 为起点",
+                   command=use_current_xy_as_start).pack(side="left", padx=8)
+        xy_controls.pack(fill="x")
+
+        ideal_move_box = ttk.Frame(top, padding=(8, 0, 8, 4))
+        ideal_move_box.pack(fill="x")
+        ttk.Label(ideal_move_box, text="移动到 X mm").pack(side="left")
+        ideal_target_x = tk.StringVar(value=str(args.xy_start_x))
+        ttk.Entry(ideal_move_box, textvariable=ideal_target_x, width=10).pack(side="left", padx=4)
+        ttk.Label(ideal_move_box, text="Y mm").pack(side="left", padx=(8, 2))
+        ideal_target_y = tk.StringVar(value=str(args.xy_start_y))
+        ttk.Entry(ideal_move_box, textvariable=ideal_target_y, width=10).pack(side="left", padx=4)
+        ttk.Label(ideal_move_box, text="速度 mm/s").pack(side="left", padx=(8, 2))
+        ideal_target_speed = tk.StringVar(value=str(args.xy_speed))
+        ttk.Entry(ideal_move_box, textvariable=ideal_target_speed, width=10).pack(side="left", padx=4)
+
+        # Mode switch: off means a plain XY move; on means that the same
+        # target button starts a synchronized XY+Z follow-focus move.
+        ideal_follow_enabled = tk.BooleanVar(value=False)
+
+        def move_ideal_stage_to_target():
+            try:
+                target = (float(ideal_target_x.get()), float(ideal_target_y.get()))
+                if not all(math.isfinite(value) for value in target):
+                    raise ValueError("XY 目标坐标必须是有限数字")
+                speed = float(ideal_target_speed.get())
+                if ideal_follow_enabled.get():
+                    with stage_lock:
+                        active_reader = stage_state["reader"]
+                    if active_reader is None:
+                        raise RuntimeError("跟焦模式需要先连接位移台")
+                    sample = active_reader.latest()
+                    current = (float(sample["x_mm"]), float(sample["y_mm"]))
+                    if not all(math.isfinite(value) for value in current):
+                        raise RuntimeError("无法读取当前位移台位置")
+                    xy_start_x_var.set(f"{current[0]:g}")
+                    xy_start_y_var.set(f"{current[1]:g}")
+                    start_ideal_synced_run(stage_start_override=current,
+                                           stage_end_override=target)
+                    return
+                if not math.isfinite(speed) or not .001 <= speed <= 500:
+                    raise ValueError("XY 速度参数无效")
+                cfg = argparse.Namespace(**vars(args))
+                cfg.stage_ip = ideal_stage_ip.get().strip()
+                cfg.stage_dll = default_dll_path()
+                cfg.xy_source = ideal_stage_source.get()
+                cancel.clear()
+                tasks.put(("move_xy_manual", cfg,
+                           {"target": target, "speed": speed}))
+                ideal_stage_status.set(
+                    f"XY: 正在移动到 ({target[0]:g}, {target[1]:g}) mm...")
+                ideal_stage_move.configure(state="disabled")
+            except Exception as exc:
+                messagebox.showerror("移动位移台", str(exc), parent=top)
+
+        ideal_stage_move = ttk.Button(ideal_move_box, text="移动到指定位置",
+                                      command=move_ideal_stage_to_target)
+        ideal_stage_move.pack(side="left", padx=(10, 3))
+        ttk.Label(ideal_move_box,
+                  text=f"速度使用主页面 XY 速度：{args.xy_speed:g} mm/s",
+                  foreground="gray").pack(side="left", padx=8)
+        def start_ideal_synced_run(stage_start_override=None,
+                                   stage_end_override=None):
+            try:
+                curve = curve_state["curve"]
+                if curve is None:
+                    raise ValueError("请先导入 mapping 曲线")
+                curve_start = float(curve_distance_start_var.get())
+                curve_end = float(curve_distance_end_var.get())
+                if not (curve.distance_mm[0] <= curve_start < curve_end <= curve.distance_mm[-1]):
+                    raise ValueError("曲线距离起点/终点必须在导入曲线范围内，且起点小于终点")
+                stage_start = (stage_start_override if stage_start_override is not None
+                               else (float(xy_start_x_var.get()), float(xy_start_y_var.get())))
+                stage_end = (stage_end_override if stage_end_override is not None
+                             else (float(xy_end_x_var.get()), float(xy_end_y_var.get())))
+                if not all(math.isfinite(v) for v in (*stage_start, *stage_end)):
+                    raise ValueError("XY 起点和终点必须是有限数字")
+                speed = float(ideal_target_speed.get())
+                xy_distance = math.dist(stage_start, stage_end)
+                if not math.isfinite(speed) or not .001 <= speed <= 500:
+                    raise ValueError("XY 速度必须在 0.001~500 mm/s")
+                if xy_distance < 1e-6:
+                    raise ValueError("XY 起点和终点不能相同")
+                total_time = xy_distance / speed
+                step_ms = 5.
+                steps = max(1, math.ceil(total_time / (step_ms / 1000)))
+                selected_mode = mode_var.get()
+                control_mode = {"GOTO": None, "A 速度微调": "VELOCITY_TRIM",
+                                "B 位置提前": "TRACK_POSITION_LEAD"}[selected_mode]
+                cfg = argparse.Namespace(**vars(args))
+                cfg.mapping_mode = True
+                cfg.mapping_file = curve.source_path
+                cfg.stage_ip = ideal_stage_ip.get().strip()
+                cfg.stage_dll = default_dll_path()
+                cfg.xy_source = ideal_stage_source.get()
+                cfg.xy_start_x, cfg.xy_start_y = stage_start
+                cfg.xy_end_x, cfg.xy_end_y = stage_end
+                cfg.xy_speed = speed
+                cfg.interval_ms = step_ms
+                cfg.steps = steps
+                cfg.velocity_mode = control_mode == "VELOCITY_TRIM"
+                cfg.position_mode = control_mode == "TRACK_POSITION_LEAD"
+                for key, variable in curve_control_vars.items():
+                    setattr(cfg, key, float(variable.get()))
+                validate_control(cfg)
+                validate_mapping(cfg)
+                step_ms_var.set(f"{step_ms:g}")
+                steps_var.set(str(steps))
+                cancel.clear()
+                start_button.configure(state="disabled")
+                ideal_stage_move.configure(state="disabled")
+                ideal_stage_status.set(
+                    f"XY+Z 同步运行：预计 {total_time:.3f} s，实际 {steps * step_ms / 1000:.3f} s")
+                tasks.put(("run_ideal_synced", cfg, {
+                    "curve": curve,
+                    "curve_start_distance": curve_start,
+                    "curve_end_distance": curve_end,
+                    "stage_start": stage_start,
+                    "stage_end": stage_end,
+                }))
+            except Exception as exc:
+                messagebox.showerror("同步运行 XY+Z", str(exc), parent=top)
+
+        def toggle_ideal_follow():
+            enabled = not ideal_follow_enabled.get()
+            ideal_follow_enabled.set(enabled)
+            if enabled:
+                ideal_synced_button.configure(
+                    text="跟焦模式：开启",
+                    bg="#d9534f", activebackground="#c9302c", fg="white")
+                ideal_stage_status.set("跟焦模式已开启：移动到指定位置将同步跟焦")
+            else:
+                ideal_synced_button.configure(
+                    text="跟焦模式：关闭",
+                    bg="#2e8b57", activebackground="#257044", fg="white")
+                ideal_stage_status.set("跟焦模式已关闭：仅移动位移台")
+
+        ideal_synced_button = tk.Button(
+            ideal_move_box, text="开始同步运行 XY+Z",
+            command=toggle_ideal_follow,
+            bg="#2e8b57", activebackground="#257044", fg="white",
+            relief="raised", padx=8)
+        ideal_synced_button.configure(text="跟焦模式：关闭")
+        ideal_synced_button.pack(side="left", padx=(10, 3))
+        ideal_page_state["stage_move"] = ideal_stage_move
+        ideal_page_state["stage_sync"] = ideal_synced_button
+
         ideal_page_state["start"] = start_button
         z_info = ttk.Frame(top, padding=(8, 0, 8, 2))
         z_info.pack(fill="x", before=xy_controls)
@@ -1570,7 +1813,10 @@ def gui(args):
 
         def page_closed():
             ideal_page_state.update(page=None, figure=None, canvas=None, status=None,
-                                    z_position=None, z_limit=None, start=None)
+                                    z_position=None, z_limit=None, start=None,
+                                    stage_status=None, stage_connect=None,
+                                    stage_disconnect=None, stage_move=None,
+                                    stage_sync=None)
             top.destroy()
         top.protocol("WM_DELETE_WINDOW", page_closed)
 
@@ -1579,6 +1825,15 @@ def gui(args):
             action()
         except Exception as exc:
             messagebox.showerror("理想测试曲线", str(exc), parent=parent)
+
+    # Dedicated entry for the imported ideal-curve test.  It reuses the
+    # existing isolated page (curve import, preview, GOTO/A/B test, stop,
+    # return-to-zero and result plot) and does not change the normal test
+    # controls or the XY mapping workflow.
+    ideal_entry = ttk.Button(controls, text="独立理想曲线测试",
+                             command=open_mapping_ideal_page)
+    ideal_entry.pack(side="left", padx=4)
+    buttons.append(ideal_entry)
 
     # 保留原按钮位置，但打开独立页面；导入和参数都在子页面内完成。
     b = ttk.Button(stage_box, text="理想测试曲线", command=open_mapping_ideal_page)
@@ -1818,6 +2073,23 @@ def gui(args):
                             value["steps"], value["mode"], cancel,
                             lambda message: messages.put(("curve_status", message)))
                         messages.put(("curve_result", result))
+                    elif action == "run_ideal_synced":
+                        if link is None:
+                            raise RuntimeError("请先连接 STM32")
+                        stage, reader = get_stage(cfg)
+                        sample = reader.latest()
+                        if math.dist((sample["x_mm"], sample["y_mm"]),
+                                     value["stage_start"]) > cfg.xy_tolerance_mm:
+                            raise RuntimeError("当前位移台不在设定的 XY 运动起点")
+                        if link.latest["state"] != 0:
+                            raise RuntimeError("Z 马达必须处于 IDLE 状态")
+                        sliced = curve_subrange(
+                            value["curve"], value["curve_start_distance"],
+                            value["curve_end_distance"], link.latest["position_um"])
+                        result = run_mapping(
+                            link, stage, reader, sliced, cfg, cancel,
+                            lambda message: messages.put(("curve_status", message)))
+                        messages.put(("curve_result", result))
                     elif action == "move_z_zero":
                         if link is None:
                             raise RuntimeError("请先连接 STM32")
@@ -1965,8 +2237,18 @@ def gui(args):
                     button.configure(state="normal")
                 if ideal_page_state["start"] is not None and ideal_page_state["page"] is not None:
                     ideal_page_state["start"].configure(state="normal")
+                if ideal_page_state["stage_connect"] is not None:
+                    ideal_page_state["stage_connect"].configure(state="normal")
+                if ideal_page_state["stage_disconnect"] is not None:
+                    ideal_page_state["stage_disconnect"].configure(state="normal")
+                if ideal_page_state["stage_move"] is not None:
+                    ideal_page_state["stage_move"].configure(state="normal")
+                if ideal_page_state["stage_sync"] is not None:
+                    ideal_page_state["stage_sync"].configure(state="normal")
             elif kind == "xy_status":
                 stage_status.set(value)
+                if ideal_page_state["stage_status"] is not None:
+                    ideal_page_state["stage_status"].set(value)
             elif kind == "curve_status":
                 if ideal_page_state["status"] is not None:
                     ideal_page_state["status"].set(value)
