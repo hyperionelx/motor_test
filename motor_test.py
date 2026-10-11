@@ -1220,6 +1220,25 @@ def gui(args):
     controls = ttk.Frame(root, padding=10)
     controls.pack(fill="x")
     buttons = []
+    camera_window_state = {"window": None}
+
+    def open_camera_window():
+        """Open the independent camera UI without touching motion controls."""
+        current = camera_window_state.get("window")
+        if current is not None:
+            try:
+                if current.top.winfo_exists():
+                    current.top.deiconify()
+                    current.top.lift()
+                    return
+            except Exception:
+                pass
+        try:
+            from camera_window import CameraWindow
+            camera_window_state["window"] = CameraWindow(root)
+        except Exception as exc:
+            messagebox.showerror("相机", f"相机窗口启动失败：{exc}")
+
     mode_vars = {key: tk.BooleanVar(value=getattr(args, key)) for key in ("velocity_mode", "position_mode")}
     mapping_enabled = tk.BooleanVar(value=args.mapping_mode)
     checkboxes = []
@@ -1263,6 +1282,8 @@ def gui(args):
     xy_control_button = ttk.Button(controls, text="XY位移台控制", command=lambda: open_xy_control())
     xy_control_button.pack(side="left", padx=4)
     buttons.append(xy_control_button)
+    camera_button = ttk.Button(controls, text="相机窗口", command=open_camera_window)
+    camera_button.pack(side="left", padx=4)
     presets = ttk.Frame(root, padding=5)
     presets.pack(fill="x")
     def preset(speed):
@@ -2310,6 +2331,12 @@ def gui(args):
     def close():
         cancel.set()
         shutdown.set()
+        camera_window = camera_window_state.get("window")
+        if camera_window is not None:
+            try:
+                camera_window.close()
+            except Exception:
+                pass
         status.set("正在停止马达并关闭串口…")
         def finish():
             if thread.is_alive() or stage_thread.is_alive():
