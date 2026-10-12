@@ -1057,7 +1057,7 @@ def draw_curve_goto_result(analysis, title, figure=None):
     from matplotlib.figure import Figure
     fig = figure or Figure(figsize=(16, 4.5), layout="constrained")
     fig.clear()
-    ax1, ax2, ax3, ax4 = fig.subplots(1, 4)
+    ax1, ax2, ax3, ax4, ax5 = fig.subplots(1, 5)
     steps, samples = analysis["steps"], analysis["samples"]
     start_um = analysis.get("curve_start_um", 0.)
     ax1.plot([r["target_um"] for r in steps],
@@ -1101,7 +1101,32 @@ def draw_curve_goto_result(analysis, title, figure=None):
     ax4.set(xlabel="Time (s)", ylabel="Relative position / distance (um)",
             title="Ideal curve vs actual")
     ax4.legend()
-    for ax in (ax1, ax2, ax3, ax4):
+
+    # Display-only error curve.  Synchronized follow-focus results provide a
+    # reference for every telemetry sample; GOTO/A/B results use command-step
+    # errors as a fallback when that sample-level reference is unavailable.
+    error_points = [
+        (s.get("time_s"), s.get("following_error_um"))
+        for s in samples
+        if s.get("time_s") is not None and s.get("following_error_um") is not None
+        and s.get("time_s") >= 0.
+    ]
+    if len(error_points) < 2:
+        error_points = [
+            (r.get("deadline_s"), r.get("error_um"))
+            for r in steps
+            if r.get("deadline_s") is not None and r.get("error_um") is not None
+            and r.get("deadline_s") >= 0.
+        ]
+    ax5.axhline(0, color="gray", linestyle="--", linewidth=1)
+    if error_points:
+        ax5.plot([p[0] for p in error_points], [p[1] for p in error_points],
+                 "o-", ms=3, color="tab:red", label="Ideal - actual")
+        ax5.legend()
+    ax5.set(xlabel="Time (s)", ylabel="Z error (um)",
+            title="Ideal - actual Z")
+
+    for ax in (ax1, ax2, ax3, ax4, ax5):
         ax.grid(alpha=0.25)
     fig.suptitle(title)
     return fig
