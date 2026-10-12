@@ -1203,7 +1203,8 @@ def gui(args):
                         "status": None, "z_position": None, "z_limit": None,
                         "start": None, "stage_status": None,
                         "stage_connect": None, "stage_disconnect": None,
-                        "stage_move": None, "stage_sync": None}
+                        "stage_move": None, "stage_sync": None,
+                        "z_zero": None}
     status = tk.StringVar(value="未连接；请先填写实际机械软限位")
     frame = ttk.Frame(root, padding=10)
     frame.pack(fill="x")
@@ -1432,6 +1433,7 @@ def gui(args):
         steps_var = tk.StringVar(value=str(args.steps))
         curve_distance_start_var = tk.StringVar(value="")
         curve_distance_end_var = tk.StringVar(value="")
+        ideal_z_zero = {"physical_um": None}
         mode_var = tk.StringVar(value="GOTO")
         file_var = tk.StringVar(value="尚未导入 mapping")
         test_status = tk.StringVar(value="请先导入 mapping 曲线")
@@ -1526,7 +1528,8 @@ def gui(args):
         canvas = FigureCanvasTkAgg(figure, master=top)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         ideal_page_state.update(figure=figure, canvas=canvas, status=test_status,
-                                z_position=z_position, z_limit=z_limit)
+                                z_position=z_position, z_limit=z_limit,
+                                z_zero=ideal_z_zero)
 
         def redraw():
             curve = curve_state["curve"]
@@ -1611,6 +1614,37 @@ def gui(args):
                 messagebox.showerror("Z 马达回零", str(exc), parent=top)
 
         ttk.Button(controls, text="Z 马达回到 0", command=move_z_zero).pack(side="left", padx=5)
+        def request_ideal_current_as_zero():
+            """Ask the motor worker for a fresh, thread-safe Z sample."""
+            try:
+                cfg = argparse.Namespace(**vars(args))
+                cancel.clear()
+                test_status.set("正在读取当前位置并设置本页参考零点...")
+                tasks.put(("set_ideal_z_zero", cfg, None))
+            except Exception as exc:
+                messagebox.showerror("设置参考零点", str(exc), parent=top)
+
+        def set_ideal_current_as_zero():
+            try:
+                if link is None or link.latest is None:
+                    raise RuntimeError("请先连接 STM32 并等待位置遥测")
+                sample = link.latest
+                if (time.perf_counter() - sample["host_abs_s"] > .3 or
+                        sample.get("state") != 0):
+                    raise RuntimeError("Z 马达必须处于 IDLE，且位置遥测必须是最新数据")
+                physical = float(sample["position_um"])
+                if not math.isfinite(physical):
+                    raise RuntimeError("当前 Z 位置无效")
+                ideal_z_zero["physical_um"] = physical
+                z_position.set("Z: 0.000 μm（本页参考零点）")
+                test_status.set(
+                    f"当前 Z={physical:.3f} μm 已设为本页参考零点；未修改 STM32 绝对坐标")
+            except Exception as exc:
+                messagebox.showerror("设置参考零点", str(exc), parent=top)
+
+        ttk.Button(controls, text="当前位置设为 0（本页参考）",
+                   command=request_ideal_current_as_zero).pack(side="left", padx=5)
+
         # Independent XY-stage connection for the ideal-curve page. The DLL
         # is resolved automatically from the bundled zmotion directory.
         ideal_stage_box = ttk.Frame(top, padding=(8, 0, 8, 4))
@@ -1693,6 +1727,7 @@ def gui(args):
         # Mode switch: off means a plain XY move; on means that the same
         # target button starts a synchronized XY+Z follow-focus move.
         ideal_follow_enabled = tk.BooleanVar(value=False)
+        ideal_capture_enabled = tk.BooleanVar(value=False)
 
         def move_ideal_stage_to_target():
             try:
@@ -1737,6 +1772,8 @@ def gui(args):
                   foreground="gray").pack(side="left", padx=8)
         def start_ideal_synced_run(stage_start_override=None,
                                    stage_end_override=None):
+            camera_for_motion = None
+            capture_armed = False
             try:
                 curve = curve_state["curve"]
                 if curve is None:
@@ -1780,6 +1817,14 @@ def gui(args):
                     setattr(cfg, key, float(variable.get()))
                 validate_control(cfg)
                 validate_mapping(cfg)
+                motion_started = None
+                if ideal_capture_enabled.get():
+                    camera_for_motion = camera_window_state.get("window")
+                    if camera_for_motion is None:
+                        raise RuntimeError("请先打开并连接相机窗口")
+                    camera_for_motion.arm_for_motion()
+                    capture_armed = True
+                    motion_started = camera_for_motion.start_motion_recording
                 step_ms_var.set(f"{step_ms:g}")
                 steps_var.set(str(steps))
                 cancel.clear()
@@ -1793,9 +1838,26 @@ def gui(args):
                     "curve_end_distance": curve_end,
                     "stage_start": stage_start,
                     "stage_end": stage_end,
+                    "motion_started": motion_started,
                 }))
             except Exception as exc:
                 messagebox.showerror("同步运行 XY+Z", str(exc), parent=top)
+
+        def toggle_ideal_capture():
+            enabled = not ideal_capture_enabled.get()
+            if enabled:
+                camera = camera_window_state.get("window")
+                if camera is None or not camera._connected.is_set():
+                    messagebox.showerror(
+                        "跟焦同步保存", "请先打开并连接相机窗口", parent=top)
+                    return
+                ideal_capture_enabled.set(True)
+                ideal_capture_button.configure(text="跟焦同步保存：开启")
+                ideal_stage_status.set("跟焦同步保存已开启：将在位移台真正开始移动时保存")
+            else:
+                ideal_capture_enabled.set(False)
+                ideal_capture_button.configure(text="跟焦同步保存：关闭")
+                ideal_stage_status.set("跟焦同步保存已关闭")
 
         def toggle_ideal_follow():
             enabled = not ideal_follow_enabled.get()
@@ -1803,21 +1865,25 @@ def gui(args):
             if enabled:
                 ideal_synced_button.configure(
                     text="跟焦模式：开启",
-                    bg="#d9534f", activebackground="#c9302c", fg="white")
+                    bg="#2e8b57", activebackground="#257044", fg="white")
                 ideal_stage_status.set("跟焦模式已开启：移动到指定位置将同步跟焦")
             else:
                 ideal_synced_button.configure(
                     text="跟焦模式：关闭",
-                    bg="#2e8b57", activebackground="#257044", fg="white")
+                    bg="#d9534f", activebackground="#c9302c", fg="white")
                 ideal_stage_status.set("跟焦模式已关闭：仅移动位移台")
 
         ideal_synced_button = tk.Button(
             ideal_move_box, text="开始同步运行 XY+Z",
             command=toggle_ideal_follow,
-            bg="#2e8b57", activebackground="#257044", fg="white",
+            bg="#d9534f", activebackground="#c9302c", fg="white",
             relief="raised", padx=8)
         ideal_synced_button.configure(text="跟焦模式：关闭")
         ideal_synced_button.pack(side="left", padx=(10, 3))
+        ideal_capture_button = ttk.Button(
+            ideal_move_box, text="跟焦同步保存：关闭",
+            command=toggle_ideal_capture)
+        ideal_capture_button.pack(side="left", padx=(3, 3))
         ideal_page_state["stage_move"] = ideal_stage_move
         ideal_page_state["stage_sync"] = ideal_synced_button
 
@@ -1837,7 +1903,7 @@ def gui(args):
                                     z_position=None, z_limit=None, start=None,
                                     stage_status=None, stage_connect=None,
                                     stage_disconnect=None, stage_move=None,
-                                    stage_sync=None)
+                                    stage_sync=None, z_zero=None)
             top.destroy()
         top.protocol("WM_DELETE_WINDOW", page_closed)
 
@@ -2109,8 +2175,21 @@ def gui(args):
                             value["curve_end_distance"], link.latest["position_um"])
                         result = run_mapping(
                             link, stage, reader, sliced, cfg, cancel,
-                            lambda message: messages.put(("curve_status", message)))
+                            lambda message: messages.put(("curve_status", message)),
+                            value.get("motion_started"))
                         messages.put(("curve_result", result))
+                    elif action == "set_ideal_z_zero":
+                        if link is None or link.latest is None:
+                            raise RuntimeError("请先连接 STM32 并等待位置遥测")
+                        link.poll()
+                        sample = link.latest
+                        if (time.perf_counter() - sample["host_abs_s"] > .3 or
+                                sample.get("state") != 0):
+                            raise RuntimeError("Z 马达必须处于 IDLE，且位置遥测必须是最新数据")
+                        physical = float(sample["position_um"])
+                        if not math.isfinite(physical):
+                            raise RuntimeError("当前 Z 位置无效")
+                        messages.put(("ideal_z_zero", physical))
                     elif action == "move_z_zero":
                         if link is None:
                             raise RuntimeError("请先连接 STM32")
@@ -2134,6 +2213,7 @@ def gui(args):
                             if time.perf_counter() >= deadline:
                                 raise TimeoutError("Z 马达回到 0 位置超时")
                             cancel.wait(.005)
+                        messages.put(("ideal_z_zero_reset", 0.0))
                     elif action == "move_xy_manual":
                         stage, reader = get_stage(cfg)
                         target = value["target"]
@@ -2273,8 +2353,30 @@ def gui(args):
             elif kind == "curve_status":
                 if ideal_page_state["status"] is not None:
                     ideal_page_state["status"].set(value)
+            elif kind == "ideal_z_zero_reset":
+                zero = ideal_page_state.get("z_zero")
+                if zero is not None:
+                    zero["physical_um"] = 0.0
+                if ideal_page_state["z_position"] is not None:
+                    ideal_page_state["z_position"].set("Z: 0.000 μm")
+            elif kind == "ideal_z_zero":
+                zero = ideal_page_state.get("z_zero")
+                if zero is not None:
+                    zero["physical_um"] = float(value)
+                if ideal_page_state["z_position"] is not None:
+                    ideal_page_state["z_position"].set(
+                        "Z: 0.000 μm（本页参考零点）")
+                if ideal_page_state["status"] is not None:
+                    ideal_page_state["status"].set(
+                        f"当前 Z={value:.3f} μm 已设为本页参考零点；未修改 STM32 绝对坐标")
             elif kind == "curve_z_position":
                 if ideal_page_state["z_position"] is not None:
+                    zero = ideal_page_state.get("z_zero")
+                    reference = zero.get("physical_um") if zero else None
+                    if reference is not None:
+                        ideal_page_state["z_position"].set(
+                            f"Z: {value - reference:.3f} μm（本页参考）")
+                        continue
                     ideal_page_state["z_position"].set(f"Z: {value:.3f} μm")
             elif kind == "curve_z_limit":
                 if ideal_page_state["z_limit"] is not None:

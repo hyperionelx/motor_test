@@ -78,7 +78,8 @@ class MappingVelocityControl:
 
 
 @motion_timer
-def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None):
+def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None,
+                motion_started=None):
     validate_mapping(cfg)
     mode = mode_name(cfg)
     line = mapping_line(curve, cfg)
@@ -146,6 +147,8 @@ def run_mapping(link, stage, reader, curve, cfg, cancel, update=lambda msg: None
             stage.move(line.end, cfg.xy_speed, cfg.xy_acceleration, prepared=True)
         else:
             stage.move(line.end, cfg.xy_speed, cfg.xy_acceleration)
+        if motion_started is not None:
+            motion_started()
         # 初次运动调用的传输耗时不当作控制调度迟到；后续不重置期限。
         next_send = time.perf_counter() - t0
         while True:
