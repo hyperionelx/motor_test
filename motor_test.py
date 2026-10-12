@@ -1749,6 +1749,22 @@ def gui(args):
         ideal_target_speed = tk.StringVar(value=str(args.xy_speed))
         ttk.Entry(ideal_move_box, textvariable=ideal_target_speed, width=10).pack(side="left", padx=4)
 
+        # This is the speed used by the ideal-page move/follow-focus entry.
+        # Keep the hint bound to this field instead of the main-page default.
+        ideal_speed_hint = tk.StringVar()
+
+        def refresh_ideal_speed_hint(*_):
+            try:
+                speed = float(ideal_target_speed.get())
+                if not math.isfinite(speed):
+                    raise ValueError
+                ideal_speed_hint.set(f"当前跟焦/移动速度：{speed:g} mm/s")
+            except (TypeError, ValueError):
+                ideal_speed_hint.set("当前跟焦/移动速度：-- mm/s")
+
+        ideal_target_speed.trace_add("write", refresh_ideal_speed_hint)
+        refresh_ideal_speed_hint()
+
         # Mode switch: off means a plain XY move; on means that the same
         # target button starts a synchronized XY+Z follow-focus move.
         ideal_follow_enabled = tk.BooleanVar(value=False)
@@ -1792,8 +1808,7 @@ def gui(args):
         ideal_stage_move = ttk.Button(ideal_move_box, text="移动到指定位置",
                                       command=move_ideal_stage_to_target)
         ideal_stage_move.pack(side="left", padx=(10, 3))
-        ttk.Label(ideal_move_box,
-                  text=f"速度使用主页面 XY 速度：{args.xy_speed:g} mm/s",
+        ttk.Label(ideal_move_box, textvariable=ideal_speed_hint,
                   foreground="gray").pack(side="left", padx=8)
         def start_ideal_synced_run(stage_start_override=None,
                                    stage_end_override=None):
