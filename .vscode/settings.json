@@ -10,12 +10,10 @@
         "editorGutter.background": "#1e1e1e00",
         "panel.background": "#1e1e1e00",
         "panelStickyScroll.background": "#1e1e1e00",
-        "tab.activeBackground": "#1e1e1e00",
         "tab.unfocusedActiveBackground": "#1e1e1e00",
         "sideBar.background": "#1e1e1ecc",
         "sideBarTitle.background": "#1e1e1ecc",
         "sideBarStickyScroll.background": "#1e1e1ecc",
-        "activityBar.background": "#1e1e1ecc",
         "editor.background": "#1e1e1ecc",
         "editorStickyScroll.background": "#1e1e1ecc",
         "editorStickyScrollGutter.background": "#1e1e1ecc",
@@ -30,14 +28,6 @@
         "menu.background": "#1e1e1ee6",
         "quickInput.background": "#1e1e1ee6",
         "statusBar.noFolderBackground": "#272727",
-        "statusBar.noFolderForeground": "#FBFBFB",
-        "titleBar.activeBackground": "#363636",
-        "titleBar.activeForeground": "#FBFBFB",
-        "titleBar.inactiveBackground": "#272727",
-        "titleBar.inactiveForeground": "#FBFBFB",
-        "statusBar.background": "#272727",
-        "statusBar.foreground": "#FBFBFB",
-        "statusBar.debuggingBackground": "#272727",
-        "statusBar.debuggingForeground": "#FBFBFB"
+        "statusBar.noFolderForeground": "#FBFBFB"
     }
 }

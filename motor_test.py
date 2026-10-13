@@ -1164,6 +1164,36 @@ def save_result(result, out_dir):
     return output, analysis
 
 
+def export_curve_data(result, filename):
+    """Export the five main curve series as one CSV file."""
+    analysis = analyze(result)
+    samples = analysis.get("samples", [])
+    steps = analysis.get("steps", [])
+    ref_times = [row["deadline_s"] for row in steps
+                 if row.get("deadline_s") is not None and row.get("target_um") is not None]
+    ref_positions = [row["target_um"] for row in steps
+                     if row.get("deadline_s") is not None and row.get("target_um") is not None]
+    ref_gap = max(0.02, 2.5 * result["config"]["sample_ms"] / 1000)
+    with Path(filename).open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=(
+            "time_s", "reference_position_um", "actual_position_um",
+            "reference_velocity_um_s", "actual_velocity_um_s", "following_error_um"))
+        writer.writeheader()
+        for sample in samples:
+            reference = sample.get("reference_um")
+            if reference is None and ref_times:
+                reference = interpolate(ref_times, ref_positions, sample.get("time_s"), ref_gap)
+            writer.writerow({
+                "time_s": sample.get("time_s"),
+                "reference_position_um": reference,
+                "actual_position_um": sample.get("position_um"),
+                "reference_velocity_um_s": sample.get("reference_velocity_um_s"),
+                "actual_velocity_um_s": sample.get("velocity_um_s"),
+                "following_error_um": sample.get("following_error_um"),
+            })
+    return len(samples)
+
+
 def demo_result(cfg):
     """明确标记的合成数据，仅验证界面、分析与导出；不会连接设备。"""
     apply_defaults(cfg)
@@ -1229,7 +1259,8 @@ def gui(args):
                         "start": None, "stage_status": None,
                         "stage_connect": None, "stage_disconnect": None,
                         "stage_move": None, "stage_sync": None,
-                        "z_zero": None}
+                        "z_zero": None, "curve_result": None,
+                        "export_button": None}
     status = tk.StringVar(value="未连接；请先填写实际机械软限位")
     frame = ttk.Frame(root, padding=10)
     frame.pack(fill="x")
@@ -1451,6 +1482,8 @@ def gui(args):
         top.transient(root)
 
         curve_state = {"curve": None, "path": ""}
+        curve_result_state = {"result": None}
+        ideal_page_state["curve_result"] = curve_result_state
         ideal_page_state.update(page=top)
         controls = ttk.Frame(top, padding=8)
         controls.pack(fill="x")
@@ -1625,10 +1658,33 @@ def gui(args):
             cancel.set()
             test_status.set("正在停止曲线测试…")
 
+        def export_curve_data_file():
+            result = curve_result_state.get("result")
+            if result is None:
+                messagebox.showinfo("导出数据", "请先完成一次曲线测试。", parent=top)
+                return
+            path = filedialog.asksaveasfilename(
+                title="导出五条曲线数据",
+                defaultextension=".csv",
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+                initialfile="curve_data.csv",
+                parent=top)
+            if not path:
+                return
+            try:
+                count = export_curve_data(result, path)
+                test_status.set(f"已导出五条曲线数据：{path}（{count} 行）")
+            except Exception as exc:
+                messagebox.showerror("导出数据", str(exc), parent=top)
+
         start_button = ttk.Button(controls, text="开始曲线 GOTO 测试", command=start_curve_test)
         start_button.pack(side="left", padx=5)
         stop_button = ttk.Button(controls, text="停止曲线测试", command=stop_curve_test)
         stop_button.pack(side="left", padx=5)
+        export_button = ttk.Button(controls, text="导出五条数据",
+                                   command=export_curve_data_file, state="disabled")
+        export_button.pack(side="left", padx=5)
+        ideal_page_state["export_button"] = export_button
         def move_z_zero():
             try:
                 cfg = argparse.Namespace(**vars(args))
@@ -1748,6 +1804,9 @@ def gui(args):
         ttk.Label(ideal_move_box, text="速度 mm/s").pack(side="left", padx=(8, 2))
         ideal_target_speed = tk.StringVar(value=str(args.xy_speed))
         ttk.Entry(ideal_move_box, textvariable=ideal_target_speed, width=10).pack(side="left", padx=4)
+        ttk.Label(ideal_move_box, text="XY 加速度 mm/s²").pack(side="left", padx=(8, 2))
+        ideal_xy_acceleration = tk.StringVar(value=str(args.xy_acceleration))
+        ttk.Entry(ideal_move_box, textvariable=ideal_xy_acceleration, width=10).pack(side="left", padx=4)
 
         # This is the speed used by the ideal-page move/follow-focus entry.
         # Keep the hint bound to this field instead of the main-page default.
@@ -1796,6 +1855,10 @@ def gui(args):
                 cfg.stage_ip = ideal_stage_ip.get().strip()
                 cfg.stage_dll = default_dll_path()
                 cfg.xy_source = ideal_stage_source.get()
+                acceleration = float(ideal_xy_acceleration.get())
+                if not math.isfinite(acceleration) or not .001 <= acceleration <= 100000:
+                    raise ValueError("XY 加速度必须在 0.001~100000 mm/s²")
+                cfg.xy_acceleration = acceleration
                 cancel.clear()
                 tasks.put(("move_xy_manual", cfg,
                            {"target": target, "speed": speed}))
@@ -1849,6 +1912,9 @@ def gui(args):
                 cfg.xy_start_x, cfg.xy_start_y = stage_start
                 cfg.xy_end_x, cfg.xy_end_y = stage_end
                 cfg.xy_speed = speed
+                cfg.xy_acceleration = float(ideal_xy_acceleration.get())
+                if not math.isfinite(cfg.xy_acceleration) or not .001 <= cfg.xy_acceleration <= 100000:
+                    raise ValueError("XY 加速度必须在 0.001~100000 mm/s²")
                 cfg.interval_ms = step_ms
                 cfg.steps = steps
                 cfg.velocity_mode = control_mode == "VELOCITY_TRIM"
@@ -1943,7 +2009,8 @@ def gui(args):
                                     z_position=None, z_limit=None, start=None,
                                     stage_status=None, stage_connect=None,
                                     stage_disconnect=None, stage_move=None,
-                                    stage_sync=None, z_zero=None)
+                                    stage_sync=None, z_zero=None,
+                                    curve_result=None, export_button=None)
             top.destroy()
         top.protocol("WM_DELETE_WINDOW", page_closed)
 
@@ -2424,6 +2491,10 @@ def gui(args):
             elif kind == "curve_result":
                 try:
                     result = value
+                    if ideal_page_state.get("curve_result") is not None:
+                        ideal_page_state["curve_result"]["result"] = result
+                    if ideal_page_state.get("export_button") is not None:
+                        ideal_page_state["export_button"].configure(state="normal")
                     analysis = analyze(result)
                     analysis["curve_start_um"] = result.get("start_um", 0.)
                     if ideal_page_state["figure"] is not None:
